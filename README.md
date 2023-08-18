@@ -5,7 +5,7 @@ This repository contains a simplistic network model to run simulations of FUS co
 ## Installation
 
 - Downaload and install an [Anaconda](https://www.anaconda.com/download/) distribution
-- Create a new Anaconda environment with a Python > 3.11, and activate it:
+- Create a new Anaconda environment with a Python >= 3.11, and activate it:
 ```
 conda create -n fusnetwork python=3.11
 conda activate fusnetwork
