@@ -1,0 +1,7 @@
+numpy
+matplotlib
+seaborn
+colorlog
+ipywidgets
+jupyterlab
+neuron>=8
