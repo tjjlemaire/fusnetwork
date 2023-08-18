@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-08-17 18:11:52
+# @Last Modified time: 2023-08-18 10:55:25
 
 import itertools
 from tqdm import tqdm
@@ -17,11 +17,18 @@ from logger import logger
 class NeuralNetwork:
     ''' Interface class to a network of neurons. '''
 
+    # Conversion factors
     UM_TO_CM = 1e-4
     NA_TO_MA = 1e-6
+    S_TO_US = 1e6
+
+    # Default model parameters
     Acell = 11.84e3  # Cell membrane area (um2)
-    mechname = 'RS'
-    vrest = -71.9  # mV
+    mechname = 'RS'  # NEURON mechanism name
+    vrest = -71.9  # neurons resting potential (mV)
+
+    # Variables to record during simulation (besides time)
+    probekeys = ['v', 'T', 'gLeak']
 
     def __init__(self, nnodes, connect=True, params=None, synweight=None, verbose=True):
         '''
@@ -49,15 +56,15 @@ class NeuralNetwork:
         if params is not None:
             self.set_mech_params(params)
         self.log('initialized')
-    
+        
+    def __repr__(self):
+        ''' String representation. '''
+        return f'{self.__class__.__name__}({self.size})'
+
     def log(self, msg):
         ''' Log message with verbose-dependent logging level. '''
         logfunc = logger.info if self.verbose else logger.debug
         logfunc(f'{self}: {msg}')
-    
-    def __repr__(self):
-        ''' String representation. '''
-        return f'{self.__class__.__name__}({self.size})'
     
     def create_nodes(self, nnodes):
         ''' Create a given number of nodes. '''
@@ -67,68 +74,20 @@ class NeuralNetwork:
     @property
     def size(self):
         return len(self.nodes)
-     
-    def connect(self, ipresyn, ipostsyn, weight=0.002):
-        '''
-        Connect a source node to a target node with a specific synapse model
-        and synaptic weight.
 
-        :param ipresyn: index of the pre-synaptic node
-        :param ipostsyn: index of the post-synaptic node
-        :param weight: synaptic weight (uS)
-        '''
-        # Create bi-exponential AMPA synapse and attach it to target node
-        syn = h.Exp2Syn(self.nodes[ipostsyn](0.5))
-        syn.tau1 = 0.1  # rise time constant (ms)
-        syn.tau2 = 3.0  # decay time constant (ms)
-        
-        # Generate network-connection between pre and post synaptic nodes
-        nc = h.NetCon(
-            self.get_var_ref(ipresyn, 'v'),  # trigger variable: pre-synaptic voltage (mV)
-            syn,  # synapse object (already attached to post-synaptic node)
-            sec=self.nodes[ipresyn]  # pre-synaptic node
-        )
-
-        # Assign netcon attributes
-        nc.threshold = 0.  # pre-synaptic voltage threshold (mV)
-        nc.delay = 1.  # synaptic delay (ms)
-        nc.weight[0] = weight * self.refarea / self.Acell  # synaptic weight (uS)
-
-        # Append synapse and netcon objects to network class atributes 
-        self.syn_objs.append(syn)
-        self.netcon_objs.append(nc)
-    
-    def connect_nodes(self, **kwargs):
-        ''' Form all specific connections between network nodes '''
-        self.log('connecting all node pairs')
-        self.syn_objs = []
-        self.netcon_objs = []
-        for pair in itertools.combinations(range(self.size), 2):
-            self.connect(*pair, **kwargs)
-            self.connect(*pair[::-1], **kwargs)
-    
-    def is_connected(self):
-        ''' Return whether network nodes are connected. '''
-        return hasattr(self, 'netcon_objs')
-    
-    def set_synaptic_weight(self, w):
-        ''' Set synaptic weight on all connections. '''
-        if not self.is_connected():
-            raise ValueError('Network nodes are not connected')
-        self.log(f'setting all synaptic weights to {w:.2f} uS')
-        for nc in self.netcon_objs:
-            nc.weight[0] = w * self.refarea / self.Acell
-    
     @property
     def refarea(self):
+        ''' Surface area of first node in the model (um2). '''
         return self.nodes[0](0.5).area()  # um2
     
     @property
     def I2i(self):
+        ''' Current to current density conversion factor (nA to mA/cm2). '''
         return self.NA_TO_MA / (self.refarea * (self.UM_TO_CM**2))
     
     @property
     def i2I(self):
+        ''' Current density to current conversion factor (mA/cm2 to nA). '''
         return 1 / self.I2i
     
     def set_biophysics(self):
@@ -184,6 +143,57 @@ class NeuralNetwork:
         ''' Set multiple mechanism parameters on a specific set of nodes. '''
         for k, v in params.items():
             self.set_mech_param(k, v, inode=inode)
+     
+    def connect(self, ipresyn, ipostsyn, weight=0.002):
+        '''
+        Connect a source node to a target node with a specific synapse model
+        and synaptic weight.
+
+        :param ipresyn: index of the pre-synaptic node
+        :param ipostsyn: index of the post-synaptic node
+        :param weight: synaptic weight (uS)
+        '''
+        # Create bi-exponential AMPA synapse and attach it to target node
+        syn = h.Exp2Syn(self.nodes[ipostsyn](0.5))
+        syn.tau1 = 0.1  # rise time constant (ms)
+        syn.tau2 = 3.0  # decay time constant (ms)
+        
+        # Generate network-connection between pre and post synaptic nodes
+        nc = h.NetCon(
+            self.get_var_ref(ipresyn, 'v'),  # trigger variable: pre-synaptic voltage (mV)
+            syn,  # synapse object (already attached to post-synaptic node)
+            sec=self.nodes[ipresyn]  # pre-synaptic node
+        )
+
+        # Assign netcon attributes
+        nc.threshold = 0.  # pre-synaptic voltage threshold (mV)
+        nc.delay = 1.  # synaptic delay (ms)
+        nc.weight[0] = weight * self.refarea / self.Acell  # synaptic weight (uS)
+
+        # Append synapse and netcon objects to network class atributes 
+        self.syn_objs.append(syn)
+        self.netcon_objs.append(nc)
+    
+    def connect_nodes(self, **kwargs):
+        ''' Form all specific connections between network nodes '''
+        self.log('connecting all node pairs')
+        self.syn_objs = []
+        self.netcon_objs = []
+        for pair in itertools.combinations(range(self.size), 2):
+            self.connect(*pair, **kwargs)
+            self.connect(*pair[::-1], **kwargs)
+    
+    def is_connected(self):
+        ''' Return whether network nodes are connected. '''
+        return hasattr(self, 'netcon_objs')
+    
+    def set_synaptic_weight(self, w):
+        ''' Set synaptic weight on all connections. '''
+        if not self.is_connected():
+            raise ValueError('Network nodes are not connected')
+        self.log(f'setting all synaptic weights to {w:.2f} uS')
+        for nc in self.netcon_objs:
+            nc.weight[0] = w * self.refarea / self.Acell
     
     def get_vector_list(self):
         ''' Return model-sized list of NEURON vectors. '''
@@ -206,24 +216,28 @@ class NeuralNetwork:
         return getattr(self.nodes[inode](0.5), varkey)
 
     def record_time(self, key='t'):
-        ''' Record time '''
+        ''' Record time vector during simulation '''
         self.probes[key] = h.Vector()
         self.probes[key].record(h._ref_t)
     
     def record_on_all_nodes(self, varname):
         '''
-        Record a given variable(s) on all nodes.
+        Record (a) given variable(s) on all nodes.
 
         :param varname: variable name(s)
         '''
+        # Recursively call function if multiple variables are provided
         if isinstance(varname, (tuple, list)):
             for v in varname:
                 self.record_on_all_nodes(v)
             return
+
+        # Initialize recording probes list for variable
         self.probes[varname] = self.get_vector_list()
+
+        # Record variable on all nodes
         for inode in range(self.size):
-            self.probes[varname][inode].record(
-                self.get_var_ref(inode, varname))
+            self.probes[varname][inode].record(self.get_var_ref(inode, varname))
     
     def set_recording_probes(self):
         ''' Initialize recording probes for all nodes. '''
@@ -233,8 +247,8 @@ class NeuralNetwork:
         # Assign time probe
         self.record_time()
 
-        # Assign voltage and temperature and other probes
-        self.record_on_all_nodes(['v', 'T', 'gLeak'])
+        # Assign probes to other variables of interest
+        self.record_on_all_nodes(self.probekeys)
     
     def extract_from_recording_probes(self):
         '''
@@ -263,25 +277,34 @@ class NeuralNetwork:
         :return: (time - amplitude) waveform vector
         '''
         return np.array([
-            [0, 0], 
-            [start, 0],
-            [start, amp],
-            [start + dur, amp],
-            [start + dur, 0],
-            [start + dur + 10, 0],
+            [0, 0],  # start at 0
+            [start, 0],  # hold at 0 until stimulus onset
+            [start, amp],  # switch to amplitude
+            [start + dur, amp],  # hold at amplitude until stimulus offset
+            [start + dur, 0],  # switch back to 0
+            [start + dur + 10, 0],  # hold at 0 for 10 ms
         ])
     
     def vecstr(self, values, suffix=None, detailed=True):
         ''' Return formatted string representation of node-specific values '''
+        # Format input as iterable if not already
         if not isinstance(values, (tuple, list, np.ndarray)):
             values = [values]
+        
+        # Determine logging precision based on input type
         precision = 1 if isinstance(values[0], float) else 0
+
+        # Format values as strings
         l = [f'{x:.{precision}f}' for x in values]
+
+        # Detailed mode: add node index to each item, and format as itemized list
         if detailed:
             l = [f'    - node {i}: {x}' for i, x in enumerate(l)]
             if suffix is not None:
                 l = [f'{item} {suffix}' for item in l]
             return '\n'.join(l)
+        
+        # Non-detailed mode: format as comma-separated list
         else:
             s = ', '.join(l)
             if len(l) > 1:
@@ -395,15 +418,11 @@ class NeuralNetwork:
 
     def extract_ap_counts(self, t, vpernode):
         ''' Extract spike counts per node from a given array of voltage traces. '''
-        nspikes = []
-        for v in vpernode:
-            aptimes = self.extract_ap_times(t, v)
-            nspikes.append(len(aptimes))
-        return np.array(nspikes)
+        return np.array([len(self.extract_ap_times(t, v)) for v in vpernode])
 
-    def plot(self, t, outvecs, tref='onset', addstimspan=True, title=None):
+    def plot_results(self, t, outvecs, tref='onset', addstimspan=True, title=None):
         '''
-        Plot results.
+        Plot the time course of variables recorded during simulation.
         
         :param t: time vector (ms)
         :param outvecs: dictionary of 2D arrays storing the time course of output variables across nodes
@@ -412,6 +431,7 @@ class NeuralNetwork:
         :param title: optional figure title (default: None)
         :return: figure handle 
         '''
+        # Log
         self.log('plotting results')
 
         # Create figure
@@ -441,6 +461,7 @@ class NeuralNetwork:
             for ax in axes:
                 ax.axvspan(*stimbounds, fc='silver', ec=None, alpha=.3, label='stimulus')
         
+        # Initialize axis index
         iax = 0
 
         # Detemrine color of time profiles
@@ -466,7 +487,7 @@ class NeuralNetwork:
         ax = axes[iax]
         ax.set_ylabel('gLeak (uS/cm2)')
         for inode, gLeak in enumerate(outvecs['gLeak']):
-            ax.plot(t, gLeak * 1e6, label=f'node{inode}', c=color)
+            ax.plot(t, gLeak * self.S_TO_US, label=f'node{inode}', c=color)
         iax += 1
 
         # Plot membrane potential time-course per node

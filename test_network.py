@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-17 08:31:42
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-08-17 18:42:13
+# @Last Modified time: 2023-08-18 10:44:57
 
 # %% Imports
 
@@ -51,7 +51,7 @@ model.set_stim(start, dur, Isppa)
 t, outvecs = model.simulate(tstop)
 
 # Plot results
-fig = model.plot(
+fig = model.plot_results(
     t, outvecs, 
     title=f'{model}, Isppa = {model.vecstr(Isppa, detailed=False, suffix="W/cm2")}')
 
@@ -62,7 +62,7 @@ for Q10 in [200, 2000]:
     params['Q10'] = Q10
     model.set_mech_params(params)
     t, outvecs = model.simulate(tstop)
-    fig = model.plot(t, outvecs, title=f'{model}, Q10 = {Q10}')
+    fig = model.plot_results(t, outvecs, title=f'{model}, Q10 = {Q10}')
 
 
 # %% Expand to 3 nodes
@@ -71,7 +71,7 @@ model = NeuralNetwork(3, params=params)
 Isppa = np.ones(model.size) * Imax  # W/cm2
 model.set_stim(start, dur, Isppa)
 t, outvecs = model.simulate(tstop)
-fig = model.plot(
+fig = model.plot_results(
     t, outvecs, 
     title=f'{model}, Isppa = {model.vecstr(Isppa, detailed=False, suffix="W/cm2")}')
 
@@ -81,7 +81,7 @@ fig = model.plot(
 for w in [.001, .005, .01]:
     model.set_synaptic_weight(w)
     t, outvecs = model.simulate(tstop)
-    fig = model.plot(t, outvecs, title=f'w = {w} uS')
+    fig = model.plot_results(t, outvecs, title=f'w = {w} uS')
 model.set_synaptic_weight(.002)
 
 
@@ -97,7 +97,7 @@ stim_dists = {
 for k, stim_dist in stim_dists.items():
     model.set_stim(start, dur, stim_dist * Imax)
     t, outvecs = model.simulate(tstop)
-    fig = model.plot(
+    fig = model.plot_results(
         t, outvecs, 
         title=f'{model}, {k} stimulation (Isppa-matched)')
 
