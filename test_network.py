@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-17 08:31:42
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-08-18 10:44:57
+# @Last Modified time: 2023-08-22 14:33:59
 
 # %% Imports
 
@@ -12,58 +12,54 @@ import matplotlib.pyplot as plt
 from network import NeuralNetwork
 from utils import pressure_to_intensity
 
-# %%  Model definition
+# Model definition
 
 # Default model parameters
 default_params = {
-    'Tref': 37,  # reference temperature (celsius)
-    'alphaT': .017,  # steady-state temperature increase (in celsius) per stimulus intensity unit
+    'Tref': 36,  # reference temperature (celsius)
+    'alphaT': .02,  # steady-state temperature increase (in celsius) per stimulus intensity unit
     'tauT_abs': 100,  # heat absorption time constant (ms)
     'tauT_diss': 100,  # heat dissipation time constant (ms)
-    'Q10': 2,  #  Q10 coefficient for temperature dependence of leak conductance
+    'Q10_rates': 3,  #  Q10 coefficient for temperature dependence of gating transitions
+    'Q10_rates': 3,  # Q10 coefficient for temperature dependence of gating transitions
+    'Q10_gNa': 1.40,  # Q10 coefficient for temperature dependence of iNa maximal conductance
+    'Q10_gKd': 4.75,  # Q10 coefficient for temperature dependence of iKd maximal conductance
+    'Q10_gNaK': 1.88,  # Q10 coefficient for temperature dependence of iNaKPump maximal conductance 
     'gamma': 1e-5, # depolarizing force (mA/cm2) per stimulus intensity unit 
+    'ibaseline': 3.43e-4,  # baseline current (mA/cm2)
 }
 
 # Define stimulus parameters and simulation time
-start = 10 # ms
+start = 200 # ms
 dur = 150  # ms
-tstop = 500  # ms
+tstop = 600  # ms
 Pmax = 3e6  # Maximal acoustic pressure amplitude (Pa)
 
 # Convert pressure to intensity
 Imax = pressure_to_intensity(Pmax) / 1e4  # (W/cm2)
 
-# %% Toy example
+# Toy example
 
 # Define model parameters
 params = default_params.copy()
+params['ibaseline'] = 1e-3  # baseline current (mA/cm2)
+params['Q10_gNaK'] = 3
+# params['gNaKPump_ref'] = 1e-7
+params['gamma'] = 0  # depolarizing force (mA/cm2) per stimulus intensity unit
 
 # Initialize model
 model = NeuralNetwork(1, params=params)
 
-# Define intensity distribution per node 
+# Set stimulus, run simulation and plot results
 Isppa = Imax  # W/cm2
-
-# Set and assign stimulus
 model.set_stim(start, dur, Isppa)
-
-# Run simulation
 t, outvecs = model.simulate(tstop)
+fig = model.plot_results(t, outvecs)
 
-# Plot results
-fig = model.plot_results(
-    t, outvecs, 
-    title=f'{model}, Isppa = {model.vecstr(Isppa, detailed=False, suffix="W/cm2")}')
-
-
-# %% Adjust Q10 coefficient to achieve inhibitory effect
-
-for Q10 in [200, 2000]:
-    params['Q10'] = Q10
-    model.set_mech_params(params)
-    t, outvecs = model.simulate(tstop)
-    fig = model.plot_results(t, outvecs, title=f'{model}, Q10 = {Q10}')
-
+# Run sweep for Isppa range, and plot spike counts vs Isppa
+Isppa_range = np.linspace(0, Imax, 15)
+nspikes = model.get_nspikes_across_sweep([1], Isppa_range, start, dur, tstop)
+fig = model.plot_sweep_results(Isppa_range, nspikes)
 
 # %% Expand to 3 nodes
 
@@ -71,9 +67,7 @@ model = NeuralNetwork(3, params=params)
 Isppa = np.ones(model.size) * Imax  # W/cm2
 model.set_stim(start, dur, Isppa)
 t, outvecs = model.simulate(tstop)
-fig = model.plot_results(
-    t, outvecs, 
-    title=f'{model}, Isppa = {model.vecstr(Isppa, detailed=False, suffix="W/cm2")}')
+fig = model.plot_results(t, outvecs)
 
 
 # %% Increase syaptic weight to achieve network entrainment

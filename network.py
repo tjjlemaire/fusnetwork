@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-08-18 10:55:25
+# @Last Modified time: 2023-08-22 14:18:27
 
 import itertools
 from tqdm import tqdm
@@ -21,14 +21,33 @@ class NeuralNetwork:
     UM_TO_CM = 1e-4
     NA_TO_MA = 1e-6
     S_TO_US = 1e6
+    S_TO_MS = 1e3
 
     # Default model parameters
     Acell = 11.84e3  # Cell membrane area (um2)
     mechname = 'RS'  # NEURON mechanism name
     vrest = -71.9  # neurons resting potential (mV)
 
-    # Variables to record during simulation (besides time)
-    probekeys = ['v', 'T', 'gLeak']
+    # Dictionary of variables to record during simulation (besides time), by category
+    record_dict = {
+        'generic': {
+            'T': 'temperature (°C)',
+            'v': 'membrane potential (mV)',
+        },
+        'conductances': {
+            'gNabar': 'sodium conductance (uS/cm2)',
+            'gKdbar': 'potassium conductance (uS/cm2)',
+            'gLeak': 'leak conductance (uS/cm2)',
+            'gNaKPump': 'sodium-potassium pump conductance (uS/cm2)',
+        },
+        'currents': {
+            'idrive': 'driving current (mA/cm2)',
+            'iNa': 'sodium current (mA/cm2)',
+            'iKd': 'potassium current (mA/cm2)',
+            'iLeak': 'leak current (mA/cm2)',
+            'iNaKPump': 'sodium-potassium pump current (mA/cm2)',
+        }
+    }
 
     def __init__(self, nnodes, connect=True, params=None, synweight=None, verbose=True):
         '''
@@ -61,9 +80,12 @@ class NeuralNetwork:
         ''' String representation. '''
         return f'{self.__class__.__name__}({self.size})'
 
-    def log(self, msg):
+    def log(self, msg, warn=False):
         ''' Log message with verbose-dependent logging level. '''
-        logfunc = logger.info if self.verbose else logger.debug
+        if warn:
+            logfunc = logger.warning
+        else:
+            logfunc = logger.info if self.verbose else logger.debug
         logfunc(f'{self}: {msg}')
     
     def create_nodes(self, nnodes):
@@ -135,7 +157,7 @@ class NeuralNetwork:
             nodestr = 'all nodes'
         else:
             nodestr = f'nodes {inode}'
-        self.log(f'setting {key} = {value} on {nodestr}')
+        self.log(f'setting {key} = {value} on {nodestr}', warn=True)
         for i in inode:
             setattr(self.nodes[i], f'{key}_{self.mechname}', value)
     
@@ -248,7 +270,8 @@ class NeuralNetwork:
         self.record_time()
 
         # Assign probes to other variables of interest
-        self.record_on_all_nodes(self.probekeys)
+        for rectype, recdict in self.record_dict.items():
+            self.record_on_all_nodes(list(recdict.keys()))
     
     def extract_from_recording_probes(self):
         '''
@@ -285,7 +308,7 @@ class NeuralNetwork:
             [start + dur + 10, 0],  # hold at 0 for 10 ms
         ])
     
-    def vecstr(self, values, suffix=None, detailed=True):
+    def vecstr(self, values, dev=None, suffix=None, detailed=True):
         ''' Return formatted string representation of node-specific values '''
         # Format input as iterable if not already
         if not isinstance(values, (tuple, list, np.ndarray)):
@@ -295,7 +318,10 @@ class NeuralNetwork:
         precision = 1 if isinstance(values[0], float) else 0
 
         # Format values as strings
-        l = [f'{x:.{precision}f}' for x in values]
+        l = [f'{x:.{precision}f}' if x is not None else 'N/A' for x in values]
+        if dev is not None:
+            devl = [f'±{x:.{precision}f}' if x is not None else '' for x in dev]
+            l = [f'{x} {dev}' for x, dev in zip(l, devl)]
 
         # Detailed mode: add node index to each item, and format as itemized list
         if detailed:
@@ -384,15 +410,26 @@ class NeuralNetwork:
         dT = np.max(outvecs['T'], axis=1) - np.min(outvecs['T'], axis=1)
         self.log(f'max temperature increase:\n{self.vecstr(dT, suffix="°C")}')
 
-        # Compute and log max relative leak conductance increase per node
-        gLeak_max = np.max(outvecs['gLeak'], axis=1)
-        gLeak_base = np.min(outvecs['gLeak'], axis=1)
-        dgLeak_rel = (gLeak_max - gLeak_base) / gLeak_base
-        self.log(f'max relative leak conductance increase:\n{self.vecstr(dgLeak_rel * 100, suffix="%")}')
+        # # Compute and log max relative leak conductance increase per node
+        # gLeak_max = np.max(outvecs['gLeak'], axis=1)
+        # gLeak_base = np.min(outvecs['gLeak'], axis=1)
+        # dgLeak_rel = (gLeak_max - gLeak_base) / gLeak_base
+        # self.log(f'max relative leak conductance increase:\n{self.vecstr(dgLeak_rel * 100, suffix="%")}')
         
-        # Count number of elicited spikes per node
-        nspikes = self.extract_ap_counts(t, outvecs['v'])
+        # Count number of elicited spikes and average firing rate per node
+        tspikes = self.extract_ap_times(t, outvecs['v'])  # ms
+        nspikes = np.array([len(ts) for ts in tspikes])
         self.log(f'number of elicited spikes:\n{self.vecstr(nspikes)}')
+        FRs = []
+        for ts in tspikes:
+            if len(ts) > 1:
+                FR = 1 / np.diff(ts) * self.S_TO_MS  # Hz
+            else:
+                FR = None
+            FRs.append(FR)
+        mu_FRs = [FR.mean() if FR is not None else None for FR in FRs]  # Hz
+        sigma_FRs = [FR.std() if FR is not None else None for FR in FRs]  # Hz
+        self.log(f'elicited firing rate:\n{self.vecstr(mu_FRs, dev=sigma_FRs, suffix="Hz")}')
         
         # Return time and dictionary arrays of recorded variables
         return t, outvecs
@@ -435,11 +472,28 @@ class NeuralNetwork:
         self.log('plotting results')
 
         # Create figure
-        hperax = 1.5
-        naxes = 4 + int(self.is_stim_set())
-        fig, axes = plt.subplots(naxes, 1, figsize=(5, hperax * naxes), sharex=True)
+        hrow = 1.5
+        wcol = 3.5
+        hasconds = 'conductances' in self.record_dict
+        hascurrs = 'currents' in self.record_dict
+        nrows = int(self.is_stim_set()) + len(self.record_dict['generic']) + int(hasconds) + int(hascurrs)
+        ncols = outvecs['v'].shape[0]
+        assert ncols == self.size, f'number of nodes ({self.size}) does not match number of output voltage traces ({ncols})'
+        fig, axes = plt.subplots(nrows, ncols, figsize=(wcol * ncols + 1.5, hrow * nrows), sharex=True, sharey='row')
+        if ncols == 1:
+            axes = np.atleast_2d(axes).T
         sns.despine(fig=fig)
-        axes[-1].set_xlabel('time (ms)')
+        for ax in axes[-1]:
+            ax.set_xlabel('time (ms)')
+        for inode, ax in enumerate(axes[0]):
+            ax.set_title(f'node {inode}')
+
+        # Define legend keyword arguments
+        leg_kwargs = dict(
+            bbox_to_anchor=(1.0, .5),
+            loc='center left',
+            frameon=False,
+        )
 
         # Extract stimulus time-course and amplitude per node
         if self.is_stim_set():
@@ -450,6 +504,11 @@ class NeuralNetwork:
             tvec = np.append(tvec, t[-1])
             stimvecs = np.hstack((stimvecs, np.atleast_2d(stimvecs[:, -1]).T))
 
+            # Extract max stimulus intensity per node, and complete column titles
+            Isppas = np.max(stimvecs, axis=1)
+            for ax, Isppa in zip(axes[0], Isppas):
+                ax.set_title(f'{ax.get_title()} - Isppa = {Isppa:.1f} W/cm2')
+
         # If specified, offset time to align 0 with stim onset
         if tref == 'onset' and self.is_stim_set():
                 t -= stimbounds[0]
@@ -458,59 +517,80 @@ class NeuralNetwork:
         
         # If specified, mark stimulus span on all axes
         if addstimspan and self.is_stim_set():
-            for ax in axes:
-                ax.axvspan(*stimbounds, fc='silver', ec=None, alpha=.3, label='stimulus')
+            for irow, axrow in enumerate(axes):
+                for ax in axrow:
+                    ax.axvspan(
+                        *stimbounds, fc='silver', ec=None, alpha=.3,
+                        label='stimulus' if irow == 0 else None)
         
-        # Initialize axis index
-        iax = 0
-
-        # Detemrine color of time profiles
-        color = 'k' if self.size == 1 else None
+        # Initialize axis row index
+        irow = 0
 
         # Plot stimulus time-course per node
         if self.is_stim_set():
-            ax = axes[iax]
-            ax.set_ylabel('Isppa (W/cm2)')
-            for inode, stim in enumerate(stimvecs):
-                ax.plot(tvec, stim, label=f'node{inode}', c=color)
-            ax.legend()
-            iax += 1
+            axrow = axes[irow]
+            axrow[0].set_ylabel('Isppa (W/cm2)')
+            for ax, stim in zip(axrow, stimvecs):
+                ax.plot(tvec, stim, c='k')
+            axrow[-1].legend(**leg_kwargs)
+            irow += 1
 
         # Plot temperature time-course per node
-        ax = axes[iax]
-        ax.set_ylabel('T (°C)')
-        for inode, T in enumerate(outvecs['T']):
-            ax.plot(t, T, label=f'node{inode}', c=color)
-        iax += 1
-        
-        # Plot leak conductance time-course per node
-        ax = axes[iax]
-        ax.set_ylabel('gLeak (uS/cm2)')
-        for inode, gLeak in enumerate(outvecs['gLeak']):
-            ax.plot(t, gLeak * self.S_TO_US, label=f'node{inode}', c=color)
-        iax += 1
+        axrow = axes[irow]
+        axrow[0].set_ylabel('T (°C)')
+        for ax, T in zip(axrow, outvecs['T']):
+            ax.plot(t, T, c='k')
+        irow += 1
+
+        # For each channel type, plot conductance time course per node
+        if hasconds:
+            axrow = axes[irow]
+            axrow[0].set_ylabel('rel. g (%)')
+            for condkey in self.record_dict['conductances']:
+                for ax, g in zip(axrow, outvecs[condkey]):
+                    if condkey.endswith('bar'):
+                       label = f'\overline{{g_{{{condkey[1:-3]}}}}}'
+                    else:
+                        label = f'g_{{{condkey[1:]}}}'
+                    ax.plot(t, g / g[0] * 100, label=f'${label}$')
+            axrow[-1].legend(**leg_kwargs)
+            irow += 1
+
+        # For each channel type, plot current time course per node
+        if hascurrs:
+            axrow = axes[irow]
+            axrow[0].set_ylabel('I (mA/cm2)')
+            for ckey, color in zip(self.record_dict['currents'], plt.get_cmap('Dark2').colors):
+                for ax, i in zip(axrow, outvecs[ckey]):
+                    ax.plot(t, i, label=f'$i_{{{ckey[1:]}}}$', color=color)
+            axrow[-1].legend(**leg_kwargs)
+            irow += 1
 
         # Plot membrane potential time-course per node
-        ax = axes[iax]
-        ax.set_ylabel('Vm (mV)')
-        for inode, v in enumerate(outvecs['v']):
-            ax.plot(t, v, label=f'node{inode}', c=color)
-        yb, yt = ax.get_ylim()
-        ax.set_ylim(min(yb, -80), max(yt, 50))
-        iax += 1
-
-        # Plot spike raster per node
-        ax = axes[iax]
-        ax.set_ylabel('node index')
-        for inode, v in enumerate(outvecs['v']):
+        axrow = axes[irow]
+        axrow[0].set_ylabel('Vm (mV)')
+        for ax, v in zip(axrow, outvecs['v']):
+            ax.plot(t, v, c='k', label='trace')
             aptimes = self.extract_ap_times(t, v)
-            ax.plot(aptimes, np.full_like(aptimes, inode), '|', label=f'node{inode}', c=color)
-        ax.set_ylim(-0.5, self.size - 0.5)
-        ax.set_yticks(range(self.size))
+            ax.plot(aptimes, np.full_like(aptimes, 70), '|', c='dimgray', label='spikes')
+            yb, yt = ax.get_ylim()
+            ax.set_ylim(min(yb, -80), max(yt, 50))
+        axrow[-1].legend(**leg_kwargs)
+        irow += 1
+
+        # # Plot spike raster per node
+        # ax = axes[iax]
+        # ax.set_ylabel('node index')
+        # for inode, v in enumerate(outvecs['v']):
+        #     aptimes = self.extract_ap_times(t, v)
+        #     ax.plot(aptimes, np.full_like(aptimes, inode), '|', label=f'node{inode}', c='k')
+        # ax.set_ylim(-0.5, self.size - 0.5)
+        # ax.set_yticks(range(self.size))
 
         # Add figure title, if specified
-        if title is not None:
-            fig.axes[0].set_title(title)
+        if title is None:
+            title = self
+        fig.suptitle(title)
         
         # Adjust layout
         fig.tight_layout()
