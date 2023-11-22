@@ -3,56 +3,64 @@ TITLE RS membrane mechanism
 INDEPENDENT {t FROM 0 TO 1 WITH 1 (ms)}
 
 NEURON {
+    : Membrane mechanism name
     SUFFIX RS
 
-    : Regular ionic currents
+    : Transmembrane currents
     NONSPECIFIC_CURRENT iNa : Sodium current
     NONSPECIFIC_CURRENT iKd : delayed-rectifier Potassium current
     NONSPECIFIC_CURRENT iLeak : non-specific leakage current
-    : NONSPECIFIC_CURRENT iM : slow non-inactivating Potassium current
+    NONSPECIFIC_CURRENT iM : slow non-inactivating Potassium current
     NONSPECIFIC_CURRENT iNaKPump : Sodium-potassium pump current
+    NONSPECIFIC_CURRENT idrive : Artificial drive current
+    NONSPECIFIC_CURRENT iKT : Thermally-driven Potassium current
 
-    : Artificial drive current
-    NONSPECIFIC_CURRENT idrive
-
-    : Python-accessible parameters
-    RANGE I, gamma, ibaseline 
-    RANGE Tref, alphaT, tauT_abs, tauT_diss
-    RANGE Q10_rates, Q10_gNa, Q10_gKd, Q10_gNaK
-    RANGE gNaKPump_ref
-
-    : Python-accessible internal variables
-    RANGE gLeak, gNabar, gKdbar, gNaKPump
+    : Python-accessible parameters/variables
+    RANGE I, gamma, ibaseline  : baseline & stimulus drive parameters
+    RANGE Tref, alphaT, tauT_abs, tauT_diss  : thermal model parameters
+    RANGE Q10_rates, Q10_gNa, Q10_gKd, Q10_gNaK  : temperature dependence parameters
+    RANGE gLeak, gNabar, gKdbar, gMbar : ion channel reference maximal conductance parameters
+    RANGE gLeak_t, gNabar_t, gKdbar_t, gMbar_t : ion channel maximal conductance variables
+    RANGE gNaKPump, gNaKPump_t : NaK pump parameters and variables 
+    RANGE gKT, gKT_t : KT parameters and variables
 }
 
 PARAMETER {
-    : Regular RS model parameters 
+    : Spiking model parameters 
     ENa = 50.0 (mV) : Sodium reversal potential
     EK = -90.0 (mV) : Potassium reversal potential
     ELeak = -70.3 (mV) : Leak reversal potential
-    EPump = -220 (mV) : Sodium-potassium pump reversal potential
     VT = -56.2 (mV) : Spike threshold adjustment parameter
-    gNabar_ref = 0.056 (S/cm2) : Maximal conductance of iNa at 36 deg. C
-    gKdbar_ref = 0.006 (S/cm2) : Maximal conductance of iKd at 36 deg. C
-    gLeak_ref = 2.05e-05 (S/cm2) : Leak conductance (at 36 deg. C)
-    gNaKPump_ref = 3e-6 :45.6e-6 (S/cm2) : Sodium-potassium pump maximal conductance (at 36 deg. C)
-    :gMbar = 7.5e-05 (S/cm2) : Maximal conductance of iM (at 36 deg. C)
-    :TauMax = 608 (ms) : Max. adaptation decay of slow non-inactivating Potassium current (at 36 deg. C)
+    gNabar = 0.056 (S/cm2) : Maximal conductance of iNa (at 36 deg. C)
+    gKdbar = 0.006 (S/cm2) : Maximal conductance of iKd (at 36 deg. C)
+    gLeak = 2.05e-05 (S/cm2) : Leak conductance (at 36 deg. C)
+    gMbar = 7.5e-05 (S/cm2) : Maximal conductance of iM (at 36 deg. C)
+    TauMax = 608 (ms) : Max. adaptation decay of slow non-inactivating Potassium current (at 36 deg. C)
 
-    : Thermal parameters
+    : Baseline and stimulus drive parameters
+    ibaseline = 0 (mA/cm2) : baseline current (e.g. thalamic drive)
+    gamma = 0 : depolarizing force (mA/cm2) per stimulus intensity unit 
+    I = 0 : time-varying stimulus intensity (t.b.d.)
+
+    : Thermal model parameters
     Tref = 36  : reference temperature (in deg. C)
-    alphaT = .02 : max temperature increase (in deg. C) per stimulus intensity unit
+    alphaT = .017 : max temperature increase (in deg. C) per stimulus intensity unit
     tauT_abs = 100 : heat absorption time constant (ms)
     tauT_diss = 100  : heat dissipation time constant (ms)
-    Q10_rates = 3  : Q10 coefficient for temperature dependence of gating transitions
-    Q10_gNa = 1.40  : Q10 coefficient for temperature dependence of iNa maximal conductance
-    Q10_gKd = 4.75  : Q10 coefficient for temperature dependence of iKd maximal conductance
-    Q10_gNaK = 1.88  : Q10 coefficient for temperature dependence of iNaKPump maximal conductance 
 
-    : Baseline and Stimulus drive parameters
-    ibaseline = 0 (mA/cm2) : baseline current (e.g. thalamic drive)
-    gamma = 1e-5 : depolarizing force (mA/cm2) per stimulus intensity unit 
-    I = 0  : time-varying stimulus intensity (t.b.d.)
+    : Q10 coefficients
+    Q10_rates = 1 : temperature dependence of gating transitions
+    Q10_gNa = 1 : temperature dependence of iNa maximal conductance
+    Q10_gKd = 1 : temperature dependence of iKd maximal conductance
+    Q10_gNaK = 1 : temperature dependence of iNaKPump maximal conductance 
+
+    : Sodium-potassium pump current parameters
+    EPump = -220 (mV) : NaK pump reversal potential
+    gNaKPump = 0 (S/cm2) : NaK pump maximal conductance (at 36 deg. C)
+    
+    : Thermally-driven Potassium current parameters
+    EKT = -93 (mV)  : KT current reversal potential
+    gKT = 0 : rate of KT conductance linear increase with temperature, in S/(cm2 * deg. C)
 }
 
 STATE {
@@ -60,7 +68,7 @@ STATE {
     m : iNa activation gate
     h : iNa inactivation gate
     n : iKd gate
-    :p : iM gate
+    p : iM gate
 
     : Additional states
     T : temperature (celsius)
@@ -75,16 +83,19 @@ ASSIGNED {
     iKd (mA/cm2)
     iLeak (mA/cm2)
     iNaKPump (mA/cm2)
-    :iM (mA/cm2)
+    iM (mA/cm2)
+    iKT (mA/cm2)
 
-    : Artificial drive current
+    : Time-varying artificial drive current
     idrive (mA/cm2)
 
-    : Ion channel conductances
-    gNabar (S/cm2)
-    gKdbar (S/cm2)
-    gLeak (S/cm2)
-    gNaKPump (S/cm2)
+    : Time-varying ion channel conductances
+    gNabar_t (S/cm2)
+    gKdbar_t (S/cm2)
+    gMbar_t (S/cm2)
+    gLeak_t (S/cm2)
+    gKT_t (S/cm2)
+    gNaKPump_t (S/cm2)
 }
 
 : VOLTAGE-DEPENDENT RATE CONSTANT FUNCTIONS TO COMPUTE GATING TRANSITIONS
@@ -124,7 +135,6 @@ FUNCTION betan(v) {
     betan = 0.5 * exp(-((v - VT) - 10) / 40) :  ms-1
 }
 
-COMMENT
 FUNCTION pinf(v) {
     : Slow non-inactivating Potassium current steady-state activation probability
     pinf = 1.0 / (1 + exp(-(v + 35) / 10))  : (-)
@@ -134,7 +144,6 @@ FUNCTION taup(v) {
     : Slow non-inactivating Potassium current activation time constant
     taup = TauMax / (3.3 * exp((v + 35) / 20) + exp(-(v + 35) / 20))  : ms
 }
-ENDCOMMENT
 
 : TEMPERATURE EVOLUTION FUNCTIONS
 
@@ -163,7 +172,7 @@ INITIAL {
     m = alpham(v) / (alpham(v) + betam(v))
     h = alphah(v) / (alphah(v) + betah(v))
     n = alphan(v) / (alphan(v) + betan(v))
-    : p = pinf(v)
+    p = pinf(v)
 
     : Initial temperature
     T = Tinf(I)
@@ -174,18 +183,21 @@ BREAKPOINT {
     SOLVE states METHOD cnexp
 
     : Update conductances based on temperature
-    gLeak = gLeak_ref
-    gNabar = gNabar_ref * phi(T, Q10_gNa)
-    gKdbar = gKdbar_ref * phi(T, Q10_gKd)
-    gNaKPump = gNaKPump_ref * phi(T, Q10_gNaK)
+    gLeak_t = gLeak
+    gNabar_t = gNabar * phi(T, Q10_gNa)
+    gKdbar_t = gKdbar * phi(T, Q10_gKd)
+    gMbar_t = gMbar * phi(T, Q10_gKd)
+    gNaKPump_t = gNaKPump * phi(T, Q10_gNaK)
+    gKT_t = gKT * (T - Tref)
 
     : Membrane currents computation
     idrive = -(gamma * I + ibaseline)  : drive current = stimulus-driven current + baseline current
-    iNa = gNabar * m * m * m * h * (v - ENa)
-    iKd = gKdbar * n * n * n * n * (v - EK)
-    iLeak = gLeak * (v - ELeak)
-    iNaKPump = gNaKPump * (v - EPump)
-    : iM = gMbar * p * (v - EK)
+    iNa = gNabar_t * m * m * m * h * (v - ENa)
+    iKd = gKdbar_t * n * n * n * n * (v - EK)
+    iM = gMbar_t * p * (v - EK)
+    iLeak = gLeak_t * (v - ELeak)
+    iNaKPump = gNaKPump_t * (v - EPump)
+    iKT = gKT_t * (v - EKT)
 }
 
 DERIVATIVE states {
@@ -193,7 +205,7 @@ DERIVATIVE states {
     m' = (alpham(v) * (1 - m) - betam(v) * m) * phi(T, Q10_rates)
     h' = (alphah(v) * (1 - h) - betah(v) * h) * phi(T, Q10_rates)
     n' = (alphan(v) * (1 - n) - betan(v) * n) * phi(T, Q10_rates)
-    : p' = (pinf(v) - p) / taup(v) * phi(T, Q10_rates)
+    p' = (pinf(v) - p) / taup(v) * phi(T, Q10_rates)
 
     : Temperature derivative
     T' = (Tinf(I) - T) / tauT(I)

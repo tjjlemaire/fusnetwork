@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-08-22 14:18:27
+# @Last Modified time: 2023-11-22 18:15:09
 
 import itertools
 from tqdm import tqdm
@@ -10,6 +10,7 @@ from neuron import h
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import warnings
 
 from logger import logger
 
@@ -37,27 +38,124 @@ class NeuralNetwork:
         'conductances': {
             'gNabar': 'sodium conductance (uS/cm2)',
             'gKdbar': 'potassium conductance (uS/cm2)',
+            'gMbar': 'slow non-inactivating potassium conductance (uS/cm2)',
             'gLeak': 'leak conductance (uS/cm2)',
+            'gKT': 'thermally-driven Potassium conductance (uS/cm2)',
             'gNaKPump': 'sodium-potassium pump conductance (uS/cm2)',
         },
         'currents': {
             'idrive': 'driving current (mA/cm2)',
             'iNa': 'sodium current (mA/cm2)',
             'iKd': 'potassium current (mA/cm2)',
+            'iM': 'slow non-inactivating potassium current (mA/cm2)',
             'iLeak': 'leak current (mA/cm2)',
+            'iKT': 'thermally-driven Potassium current (uA/cm2)',
             'iNaKPump': 'sodium-potassium pump current (mA/cm2)',
-        }
+        },
     }
 
-    def __init__(self, nnodes, connect=True, params=None, synweight=None, verbose=True):
+    TIMEVAR_SUFFIX = '_t'  # suffix to add to time-varying conductance variables
+
+    @classmethod
+    def record_keys(cls, kind):
+        ''' 
+        Return serialized list of recordable variables corresponding to one or more categories.
+
+        :param kind: category name or list of category names
+        '''
+        # If single category name provided, convert to list
+        if isinstance(kind, str):
+            kind = [kind]
+        
+        # Return list of recordable variables
+        l = []
+        for k in kind:
+            try:
+                keys = list(cls.record_dict[k].keys())
+            except KeyError:
+                raise ValueError(f'Invalid recordable variable category: {k}')
+            l = l + keys
+        return l
+    
+    @classmethod
+    def parse_record_keys(cls, keys):
+        '''
+        Parse a list of recordable variable names and/or recordable categories into
+        a list of recordable variables
+
+        :param keys: list of recordable variable names and/or recordable categories
+        :return: list of recordable variable names
+        '''
+        # If no keys provided, return empty list
+        if keys is None:
+            return []
+
+        # If single key provided, convert to list
+        if isinstance(keys, str):
+            keys = [keys]
+        
+        # Parse list of keys
+        l = []
+        # For each key
+        for k in keys:
+            # If recording category, add keys of corresponding category
+            if k in cls.record_dict:
+                l = l + cls.record_keys(k)
+            # Otherwise, look for matching recording variable and add it
+            else:
+                found = False
+                for rdict in cls.record_dict.values():
+                    if k in rdict.keys():
+                        l.append(k)
+                        found = True
+                        break
+
+                # If no match found, raise error
+                if not found:
+                    raise ValueError(f'Invalid recordable variable: {k}')
+        
+        # Remove duplicates and return list
+        return list(dict.fromkeys(l))
+
+    @classmethod
+    def filter_record_keys(cls, include=None, exclude=None):
+        ''' 
+        Construct a list of recordable variables given inclusion and exclustion criteria
+        
+        :param include: list of variables to include
+        :param exclude: list of variables to exclude
+        :return: filtered record dictionary
+        '''
+        # Get serialized list of all recordable variables
+        allkeys = cls.record_keys(list(cls.record_dict.keys()))
+
+        # List variables that should be excluded
+        toremove = []
+        if exclude is not None:
+            exclude = cls.parse_record_keys(exclude)
+            for k in allkeys:
+                if k in exclude:
+                    toremove.append(k)
+        if include is not None:
+            include = cls.parse_record_keys(include)
+            for k in allkeys:
+                if k not in include:
+                    toremove.append(k)
+        toremove = list(set(toremove))
+
+        # Return filtered list
+        allkeys = [k for k in allkeys if k not in toremove]
+        return allkeys
+
+    def __init__(self, nnodes, connect=True, synweight=None, verbose=True, **kwargs):
         '''
         Initialize a neural network with a given number of nodes.
         
         :param nnodes: number of nodes
         :param connect: whether to connect nodes (default: True)
-        :param params: dictionary of model parameters (default: None)
         :param synweight: synaptic weight (uS) (default: None)
         :param verbose: verbosity flag (default: True)
+        :param kwargs: model parameters passed as "key=value" pairs (optional)
         '''
         # Set verbosity
         self.verbose = verbose
@@ -72,8 +170,12 @@ class NeuralNetwork:
                 conkwargs['weight'] = synweight
             self.connect_nodes(**conkwargs)
         # Set model parameters, if provided
-        if params is not None:
-            self.set_mech_params(params)
+        self.set_mech_param(**kwargs)
+        # Set default stimulus parameters and simulation duration to None
+        self.start = None
+        self.dur = None
+        self.tstop = None
+        # Log initialization completion
         self.log('initialized')
         
     def __repr__(self):
@@ -128,8 +230,21 @@ class NeuralNetwork:
             return getattr(self.nodes[inode], f'{key}_{self.mechname}')
         except AttributeError:
             raise ValueError(f'"{self.mechname}" mechanism does not have parameter "{key}"')
+        
+    def __getattr__(self, name):
+        '''
+        Redefinition of __getattr__ method to allow to get mechanism parameters
+        
+        :param name: parameter name
+        '''
+        # If name is a mechanism parameter, return it
+        try:
+            return self.get_mech_param(name)
+        # Otherwise, raise error
+        except ValueError:
+            raise AttributeError(f'"{self}" does not have "{name}" attribute')
     
-    def set_mech_param(self, key, value, inode=None):
+    def _set_mech_param(self, key, value, inode=None):
         '''
         Set a specific mechanism parameter on a specific set of nodes.
         
@@ -161,10 +276,16 @@ class NeuralNetwork:
         for i in inode:
             setattr(self.nodes[i], f'{key}_{self.mechname}', value)
     
-    def set_mech_params(self, params, inode=None):
-        ''' Set multiple mechanism parameters on a specific set of nodes. '''
-        for k, v in params.items():
-            self.set_mech_param(k, v, inode=inode)
+    def set_mech_param(self, inode=None, **kwargs):
+        ''' 
+        Wrapper around "_set_mech_param" method allowing to set multiple mechanism parameters
+        at once using "key=value" syntax.
+        
+        :param inode: node index (default: None, i.e. all nodes)
+        :param kwargs: dictionary of parameter names and values
+        '''
+        for k, v in kwargs.items():
+            self._set_mech_param(k, v, inode=inode)
      
     def connect(self, ipresyn, ipostsyn, weight=0.002):
         '''
@@ -253,13 +374,38 @@ class NeuralNetwork:
             for v in varname:
                 self.record_on_all_nodes(v)
             return
+        
+        # Strip trailing suffix if present (for conductances)
+        # to define variable key
+        varkey = varname.rstrip(self.TIMEVAR_SUFFIX)
 
         # Initialize recording probes list for variable
-        self.probes[varname] = self.get_vector_list()
+        self.probes[varkey] = self.get_vector_list()
 
         # Record variable on all nodes
+        logger.debug(f'recording "{varname}" on all nodes with key "{varkey}"')
         for inode in range(self.size):
-            self.probes[varname][inode].record(self.get_var_ref(inode, varname))
+            self.probes[varkey][inode].record(self.get_var_ref(inode, varname))
+    
+    def get_disabled_currents(self):
+        ''' List disabled membrane currents in the model (i.e. those with null
+        reference conductances)
+
+        :return: list of (conductance key, current key) tuples for all disabled currents
+        '''
+        l = []
+        for gkey in self.record_dict['conductances'].keys():
+            if self.get_mech_param(gkey) == 0:
+                l.append((
+                    gkey,   # conductance key
+                    f'i{gkey[1:]}'.rstrip('bar')   # current key
+                ))
+        self.log(f'disabled currents: {", ".join([ikey for _, ikey in l])}')
+        return l
+    
+    def get_disabled_keys(self):
+        ''' List all keys associated to disabled currents '''
+        return list(itertools.chain(*self.get_disabled_currents()))
     
     def set_recording_probes(self):
         ''' Initialize recording probes for all nodes. '''
@@ -269,9 +415,23 @@ class NeuralNetwork:
         # Assign time probe
         self.record_time()
 
-        # Assign probes to other variables of interest
+        disabled_keys = self.get_disabled_keys()
+
+        # For other variables of interest
         for rectype, recdict in self.record_dict.items():
-            self.record_on_all_nodes(list(recdict.keys()))
+            # Get list of keys to record
+            reckeys = list(recdict.keys())
+
+            # Remove keys corresponding to disabled currents from list of keys to record
+            reckeys = [k for k in reckeys if k not in disabled_keys]
+
+            # For conductances, append suffix to key to record
+            # conductance variable instead of its reference value
+            if rectype == 'conductances':
+                reckeys = [f'{k}{self.TIMEVAR_SUFFIX}' for k in reckeys]
+
+            # Record variables on all nodes
+            self.record_on_all_nodes(reckeys)
     
     def extract_from_recording_probes(self):
         '''
@@ -308,7 +468,7 @@ class NeuralNetwork:
             [start + dur + 10, 0],  # hold at 0 for 10 ms
         ])
     
-    def vecstr(self, values, dev=None, suffix=None, detailed=True):
+    def vecstr(self, values, dev=None, prefix=None, suffix=None, detailed=True):
         ''' Return formatted string representation of node-specific values '''
         # Format input as iterable if not already
         if not isinstance(values, (tuple, list, np.ndarray)):
@@ -325,6 +485,8 @@ class NeuralNetwork:
 
         # Detailed mode: add node index to each item, and format as itemized list
         if detailed:
+            if prefix is not None:
+                l = [f'{prefix} {item}' for item in l]
             l = [f'    - node {i}: {x}' for i, x in enumerate(l)]
             if suffix is not None:
                 l = [f'{item} {suffix}' for item in l]
@@ -335,16 +497,28 @@ class NeuralNetwork:
             s = ', '.join(l)
             if len(l) > 1:
                 s = f'[{s}]'
+            if prefix is not None:
+                s = f'{prefix} {s}'
             if suffix is not None:
                 s = f'{s} {suffix}'
             return s
 
-    def set_stim(self, start, dur, amps):
+    def set_stim(self, amps, start=None, dur=None):
         ''' Set stimulus per node node with specific waveform parameters. '''
+        # If stimulus start/duration provided, update class attribute
+        if start is not None:
+            self.start = start
+        if dur is not None:
+            self.dur = dur
+
         # Check that stimulus start and duration are valid
-        if start < 0:
+        if self.start is None:
+            raise ValueError('No stimulus start time defined')
+        elif self.start < 0:
             raise ValueError('Stimulus start time must be positive')
-        if dur <= 0:
+        if self.dur is None:
+            raise ValueError('No stimulus duration defined')
+        elif self.dur <= 0:
             raise ValueError('Stimulus duration must be strictly positive')
 
         # If scalar amplitude provided, expand to all nodes
@@ -358,12 +532,12 @@ class NeuralNetwork:
             raise ValueError('Stimulus amplitude must be positive')
         
         amps_str = self.vecstr(amps, suffix='W/cm2')
-        self.log(f'setting {dur:.2f} ms stimulus with node-specific amplitudes:\n{amps_str}')
+        self.log(f'setting {self.dur:.2f} ms stimulus with node-specific amplitudes:\n{amps_str}')
         
         # Set stimulus vectors
         self.h_yvecs = []
         for amp in amps:
-            tvec, yvec = self.get_stim_waveform(start, dur, amp).T
+            tvec, yvec = self.get_stim_waveform(self.start, self.dur, amp).T
             self.h_yvecs.append(h.Vector(yvec))
         self.h_tvec = h.Vector(tvec)
 
@@ -381,25 +555,45 @@ class NeuralNetwork:
         tvec = np.array(self.h_tvec.to_python())
         stimvecs = np.array([y.to_python() for y in self.h_yvecs])
         return tvec, stimvecs
+    
+    def remove_stim(self):
+        ''' Remove stimulus from all nodes. '''
+        if not self.is_stim_set():
+            self.log('no stimulus to remove')
+        self.log('removing stimulus')
+        for inode in range(self.size):
+            self.h_yvecs[inode].play_remove()
+        del self.h_tvec
+        del self.h_yvecs
+        self.start = None
+        self.dur = None
         
-    def simulate(self, tstop):
+    def simulate(self, tstop=None):
         '''
         Run a simulation for a given duration.
         
         :param tstop: simulation duration (ms)
         :return: (time vector, voltage-per-node array) tuple
         '''
+        # If simulation duration provided, update class attribute
+        if tstop is not None:
+            self.tstop = tstop
+        
+        # If no simulation duration defined, raise error
+        if self.tstop is None:
+            raise ValueError('No simulation duration defined')
+        
         # Check that simulation duration outlasts stimulus waveform
-        if self.is_stim_set() and tstop < self.h_tvec.x[-1]:
+        if self.is_stim_set() and self.tstop < self.h_tvec.x[-1]:
             raise ValueError('Simulation duration must be longer than stimulus waveform offset')
         
         # Initialize recording probes
         self.set_recording_probes()
 
         # Run simulation
-        self.log(f'simulating for {tstop:.2f} ms')
+        self.log(f'simulating for {self.tstop:.2f} ms')
         h.finitialize(self.vrest)
-        while h.t < tstop:
+        while h.t < self.tstop:
             h.fadvance()
         
         # Convert NEURON vectors to numpy arrays
@@ -407,19 +601,13 @@ class NeuralNetwork:
         t, outvecs = self.extract_from_recording_probes()
 
         # Compute and log max temperature increase per node
-        dT = np.max(outvecs['T'], axis=1) - np.min(outvecs['T'], axis=1)
-        self.log(f'max temperature increase:\n{self.vecstr(dT, suffix="°C")}')
-
-        # # Compute and log max relative leak conductance increase per node
-        # gLeak_max = np.max(outvecs['gLeak'], axis=1)
-        # gLeak_base = np.min(outvecs['gLeak'], axis=1)
-        # dgLeak_rel = (gLeak_max - gLeak_base) / gLeak_base
-        # self.log(f'max relative leak conductance increase:\n{self.vecstr(dgLeak_rel * 100, suffix="%")}')
+        dT = self.compute_metric(t, outvecs, 'dT')
+        self.log(f'max temperature increase:\n{self.vecstr(dT, prefix="ΔT =", suffix="°C")}')
         
         # Count number of elicited spikes and average firing rate per node
         tspikes = self.extract_ap_times(t, outvecs['v'])  # ms
         nspikes = np.array([len(ts) for ts in tspikes])
-        self.log(f'number of elicited spikes:\n{self.vecstr(nspikes)}')
+        self.log(f'number of elicited spikes:\n{self.vecstr(nspikes, prefix="n =", suffix="spikes")}')
         FRs = []
         for ts in tspikes:
             if len(ts) > 1:
@@ -429,7 +617,7 @@ class NeuralNetwork:
             FRs.append(FR)
         mu_FRs = [FR.mean() if FR is not None else None for FR in FRs]  # Hz
         sigma_FRs = [FR.std() if FR is not None else None for FR in FRs]  # Hz
-        self.log(f'elicited firing rate:\n{self.vecstr(mu_FRs, dev=sigma_FRs, suffix="Hz")}')
+        self.log(f'elicited firing rate:\n{self.vecstr(mu_FRs, dev=sigma_FRs, prefix="FR =", suffix="Hz")}')
         
         # Return time and dictionary arrays of recorded variables
         return t, outvecs
@@ -456,28 +644,61 @@ class NeuralNetwork:
     def extract_ap_counts(self, t, vpernode):
         ''' Extract spike counts per node from a given array of voltage traces. '''
         return np.array([len(self.extract_ap_times(t, v)) for v in vpernode])
+    
+    def filter_output(self, outvecs, **kwargs):
+        '''
+        Filter simulation output variables according to inclusion and exclusion criteria.
 
-    def plot_results(self, t, outvecs, tref='onset', addstimspan=True, title=None):
+        :param outvecs: dictionary of 2D arrays storing the time course of output variables across nodes
+        :param kwargs: inclusion and exclusion criteria
+        :return: filtered output dictionary
+        '''
+        # Extract list of keys from inclusion and exclusion criteria
+        keys = self.filter_record_keys(**kwargs)
+
+        # Get intersection between keys and output dictionary keys 
+        # (in case some currents are disabled)
+        keys = [k for k in keys if k in outvecs.keys()]
+
+        # Return filtered output dictionary
+        return {k: outvecs[k] for k in keys}
+
+    def plot_results(self, t, outvecs, tref='onset', gmode='abs', addstimspan=True, title=None, **kwargs):
         '''
         Plot the time course of variables recorded during simulation.
         
         :param t: time vector (ms)
         :param outvecs: dictionary of 2D arrays storing the time course of output variables across nodes
         :param tref: time reference for x-axis (default: 'onset')
+        :param gmode: conductance plotting mode (default: 'abs'). One of:
+            - "abs" (for absolute)
+            - "rel" (for relative)
+            - "norm" (for normalized)
+            - "log" (for logarithmic) 
         :param addstimspan: whether to add a stimulus span on all axes (default: True)
         :param title: optional figure title (default: None)
         :return: figure handle 
         '''
+        # Check that plotting mode is valid
+        if gmode not in ['abs', 'rel', 'log', 'norm']:
+            raise ValueError(f'Invalid conductance plotting mode: {gmode}')
+
+        # Filter output 
+        outvecs = self.filter_output(outvecs, **kwargs)
+
         # Log
         self.log('plotting results')
 
         # Create figure
         hrow = 1.5
         wcol = 3.5
-        hasconds = 'conductances' in self.record_dict
-        hascurrs = 'currents' in self.record_dict
-        nrows = int(self.is_stim_set()) + len(self.record_dict['generic']) + int(hasconds) + int(hascurrs)
-        ncols = outvecs['v'].shape[0]
+        hastemps = 'T' in outvecs
+        hasconds = 'conductances' in self.record_dict and any(k in outvecs for k in self.record_dict['conductances'])
+        hascurrs = 'currents' in self.record_dict and any(k in outvecs for k in self.record_dict['currents'])
+        hasvoltages = 'v' in outvecs
+        nrows = int(self.is_stim_set()) + int(hastemps) + int(hasconds) + int(hascurrs) + int(hasvoltages)
+        refkey = list(outvecs.keys())[0]
+        ncols = outvecs[refkey].shape[0]
         assert ncols == self.size, f'number of nodes ({self.size}) does not match number of output voltage traces ({ncols})'
         fig, axes = plt.subplots(nrows, ncols, figsize=(wcol * ncols + 1.5, hrow * nrows), sharex=True, sharey='row')
         if ncols == 1:
@@ -536,24 +757,43 @@ class NeuralNetwork:
             irow += 1
 
         # Plot temperature time-course per node
-        axrow = axes[irow]
-        axrow[0].set_ylabel('T (°C)')
-        for ax, T in zip(axrow, outvecs['T']):
-            ax.plot(t, T, c='k')
-        irow += 1
+        if hastemps:
+            axrow = axes[irow]
+            axrow[0].set_ylabel('T (°C)')
+            for ax, T in zip(axrow, outvecs['T']):
+                ax.plot(t, T, c='k')
+            irow += 1
 
         # For each channel type, plot conductance time course per node
         if hasconds:
             axrow = axes[irow]
-            axrow[0].set_ylabel('rel. g (%)')
+            if gmode == 'rel':
+                ylabel = 'g/g0 (%)'
+            elif gmode == 'norm':
+                ylabel = 'g/gmax (%)'
+            else:
+                ylabel = 'g (uS/cm2)'
+            axrow[0].set_ylabel(ylabel)
             for condkey in self.record_dict['conductances']:
-                for ax, g in zip(axrow, outvecs[condkey]):
-                    if condkey.endswith('bar'):
-                       label = f'\overline{{g_{{{condkey[1:-3]}}}}}'
-                    else:
-                        label = f'g_{{{condkey[1:]}}}'
-                    ax.plot(t, g / g[0] * 100, label=f'${label}$')
+                if condkey in outvecs:
+                    for ax, g in zip(axrow, outvecs[condkey]):
+                        if condkey.endswith('bar'):
+                            label = f'\overline{{g_{{{condkey[1:-3]}}}}}'
+                        else:
+                            label = f'g_{{{condkey[1:]}}}'
+                        if gmode == 'rel':
+                            if g[0] == 0:
+                                logger.warning(f'Cannot compute relative conductance for {label}: baseline is 0')
+                            with warnings.catch_warnings():
+                                warnings.simplefilter('ignore')
+                                g = g / g[0] * 100
+                        elif gmode == 'norm':
+                            g = g / np.max(g) * 100
+                        ax.plot(t, g, label=f'${label}$')
             axrow[-1].legend(**leg_kwargs)
+            if gmode == 'log':
+                for ax in axrow:
+                    ax.set_yscale('log')
             irow += 1
 
         # For each channel type, plot current time course per node
@@ -561,22 +801,24 @@ class NeuralNetwork:
             axrow = axes[irow]
             axrow[0].set_ylabel('I (mA/cm2)')
             for ckey, color in zip(self.record_dict['currents'], plt.get_cmap('Dark2').colors):
-                for ax, i in zip(axrow, outvecs[ckey]):
-                    ax.plot(t, i, label=f'$i_{{{ckey[1:]}}}$', color=color)
+                if ckey in outvecs:
+                    for ax, i in zip(axrow, outvecs[ckey]):
+                        ax.plot(t, i, label=f'$i_{{{ckey[1:]}}}$', color=color)
             axrow[-1].legend(**leg_kwargs)
             irow += 1
 
         # Plot membrane potential time-course per node
-        axrow = axes[irow]
-        axrow[0].set_ylabel('Vm (mV)')
-        for ax, v in zip(axrow, outvecs['v']):
-            ax.plot(t, v, c='k', label='trace')
-            aptimes = self.extract_ap_times(t, v)
-            ax.plot(aptimes, np.full_like(aptimes, 70), '|', c='dimgray', label='spikes')
-            yb, yt = ax.get_ylim()
-            ax.set_ylim(min(yb, -80), max(yt, 50))
-        axrow[-1].legend(**leg_kwargs)
-        irow += 1
+        if hasvoltages:
+            axrow = axes[irow]
+            axrow[0].set_ylabel('Vm (mV)')
+            for ax, v in zip(axrow, outvecs['v']):
+                ax.plot(t, v, c='k', label='trace')
+                aptimes = self.extract_ap_times(t, v)
+                ax.plot(aptimes, np.full_like(aptimes, 70), '|', c='dimgray', label='spikes')
+                yb, yt = ax.get_ylim()
+                ax.set_ylim(min(yb, -80), max(yt, 50))
+            axrow[-1].legend(**leg_kwargs)
+            irow += 1
 
         # # Plot spike raster per node
         # ax = axes[iax]
@@ -588,9 +830,10 @@ class NeuralNetwork:
         # ax.set_yticks(range(self.size))
 
         # Add figure title, if specified
-        if title is None:
+        if title is None and ncols > 1:
             title = self
-        fig.suptitle(title)
+        if title is not None:
+            fig.suptitle(title)
         
         # Adjust layout
         fig.tight_layout()
@@ -598,18 +841,20 @@ class NeuralNetwork:
         # Return figure
         return fig
     
-    def get_nspikes_across_sweep(self, stimdist, Isppas, start, dur, tstop):
+    def run_sweep(self, Isppas, stimdist=None, **kwargs):
         ''' 
-        Simulate model across a range of stimulus intensities and compute the 
-        number of elicited spikes per node across the range.
+        Simulate model across a range of stimulus intensities and return outputs.
         
-        :param stimdist: stimulus distribution vector spcifying relative intensities at each node
-        :param Isppa_range: range of stimulus intensities (W/cm2)
-        :param start: stimulus start time (ms)
-        :param dur: stimulus duration (ms)
-        :param tstop: simulation duration (ms)
+        :param Isppas: range of stimulus intensities (W/cm2)
+        :param stimdist (optional): vector spcifying relative stimulus intensities at each node. 
+            If not provided, all nodes will be stimulated with the same intensity.
+        :param kwargs: optional arguments passed to "set_stim" and "simulate" methods
         :return: 2D array with number of spikes per node across stimulus intensities
         '''
+        # If stimulus distribution vector not provided, assume uniform distribution across nodes
+        if stimdist is None:
+            stimdist = [1] * self.size
+        
         # Check that stimulus distribution vector is valid
         if len(stimdist) != self.size:
             raise ValueError(f'Number of stimulus distribution values {len(stimdist)} does not match number of nodes {self.size}')
@@ -627,44 +872,90 @@ class NeuralNetwork:
         vb = self.verbose
         self.verbose = False
 
-        # Simulate model for each stimulus vector, and count number of spikes per node
-        nspikes = np.zeros_like(Isppa_vec_range)
-        for i, Isppa_vec in tqdm(enumerate(Isppa_vec_range)):
-            self.set_stim(start, dur, Isppa_vec)
-            t, out = self.simulate(tstop)
-            nspikes[i] = self.extract_ap_counts(t, out['v'])
+        # Simulate model for each stimulus vector, assemble outputs list
+        tstop = kwargs.pop('tstop', None)
+        outs = []
+        for Isppa_vec in tqdm(Isppa_vec_range):
+            self.set_stim(Isppa_vec, **kwargs)
+            t, out = self.simulate(tstop=tstop)
+            outs.append(out)
         
         # Restore verbosity
         self.verbose = vb
-        
-        # Return 2D array of spike counts per node across stimulus intensities
-        return nspikes
+
+        # Return time vector and list of outputs across stimulus intensities
+        return t, outs
     
-    def plot_sweep_results(self, Isppa_range, nspikes, title=None, ax=None):
+    def compute_metric(self, t, out, metric):
+        ''' Compute metric across nodes from a given output dictionary. '''
+        if metric == 'nspikes':
+            return self.extract_ap_counts(t, out['v'])
+        elif metric == 'dT':
+            return np.max(out['T'], axis=1) - np.min(out['T'], axis=1)
+        else:
+            raise ValueError(f'Invalid metric: {metric}')
+    
+    def plot_sweep_results(self, Isppas, t, outs, metric, title=None, ax=None, width=4, height=2):
         '''
         Plot results of a sweep across stimulus intensities.
         
-        :param Isppa_range: range of stimulus intensities (W/cm2)
-        :param nspikes: 2D array with number of spikes per node across stimulus intensities
+        :param Isppas: range of stimulus intensities (W/cm2)
+        :param t: time vector (ms)
+        :param outs: list of outputs across stimulus intensities
+        :param metric: metric(s) to plot
         :param title: optional figure title (default: None)
         :param ax: optional axis handle (default: None)
         :return: figure handle
         '''
+        # If multiple metrics provided, recursively call function for each metric
+        if isinstance(metric, (tuple, list)) and len(metric) > 1:
+            # Create figure
+            nmetrics = len(metric)
+            fig, axes = plt.subplots(nmetrics, 1, figsize=(width, height * nmetrics), sharex=True)
+            if title is not None:
+                fig.suptitle(title)
+
+            # Plot each metric on a separate axis
+            for ax, m in zip(axes, metric):
+                self.plot_sweep_results(Isppas, t, outs, m, ax=ax)
+            
+            # Return figure
+            return fig
+        
         # Create figure and axis, if not provided
         if ax is None:
-            fig, ax = plt.subplots()
+            fig, ax = plt.subplots(figsize=(width, height))
         else:
             fig = ax.get_figure()
         sns.despine(ax=ax)
 
-        # Plot spike counts vs Isppa
+        # Determine number of nodes and stimulus intensities
+        nstims = len(outs)
+        if nstims != len(Isppas):
+            raise ValueError(
+                f'number of stimulus intensities ({nstims}) does not match number of outputs ({len(Isppas)})')
+        k = list(outs[0].keys())[0]
+        nnodes = len(outs[0][k])
+
+        # Compute metric across nodes and stimulus intensities
+        m = np.zeros((nstims, nnodes))
+        for istim, out in enumerate(outs):
+            m[istim] = self.compute_metric(t, out, metric)
+
+        # Plot metric vs Isppa
         ax.set_xlabel('Isppa (W/cm2)')
-        ax.set_ylabel('# spikes')
+        ylabel = metric
+        if metric == 'dT':
+            ylabel += ' (°C)'
+        ax.set_ylabel(ylabel)
         if title is not None:
-            ax.set_title(title)
-        for i, n in enumerate(nspikes.T):
-            ax.plot(Isppa_range, n, '.-', label=f'node {i}')
-        ax.legend()
+            ax.set_title(title)        
+        for inode, vec in enumerate(m.T):
+            ax.plot(Isppas, vec, '.-', label=f'node {inode}')
+
+        # Add legend if multiple nodes
+        if nnodes > 1:
+            ax.legend()
 
         # Return figure
         return fig
