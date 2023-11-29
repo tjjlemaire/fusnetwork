@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-11-22 18:15:09
+# @Last Modified time: 2023-11-29 10:20:31
 
 import itertools
 from tqdm import tqdm
@@ -13,6 +13,23 @@ import seaborn as sns
 import warnings
 
 from logger import logger
+
+
+def get_NetStim(freq, start=0., number=1e9, noise=0):
+    '''
+    Wrapper around NetStim allowing to set parameters in 1-liner.
+    
+    :param freq: spiking frequency of pre-synaptic drive (Hz)
+    :param start (optional): start time (ms)
+    :param number (optional): total number of pre-synaptic spikes
+    :return: NetStim object
+    '''
+    stim = h.NetStim()
+    stim.number = number
+    stim.start = start # ms
+    stim.interval = 1e3 / freq  # ms
+    stim.noise = noise
+    return stim
 
 
 class NeuralNetwork:
