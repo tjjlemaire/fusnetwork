@@ -12,17 +12,18 @@ NEURON {
     NONSPECIFIC_CURRENT iLeak : non-specific leakage current
     NONSPECIFIC_CURRENT iM : slow non-inactivating Potassium current
     NONSPECIFIC_CURRENT iNaKPump : Sodium-potassium pump current
-    NONSPECIFIC_CURRENT idrive : Artificial drive current
+    NONSPECIFIC_CURRENT iStim : Stimulus-driven depolarizing current
     NONSPECIFIC_CURRENT iKT : Thermally-driven Potassium current
 
     : Python-accessible parameters/variables
-    RANGE I, gamma, ibaseline  : baseline & stimulus drive parameters
+    RANGE I : stimulus parameters
+    RANGE iStimbar, iStimx0, iStimdx : stimulus-driven current parameters
     RANGE Tref, alphaT, tauT_abs, tauT_diss  : thermal model parameters
     RANGE Q10_rates, Q10_gNa, Q10_gKd, Q10_gNaK  : temperature dependence parameters
     RANGE gLeak, gNabar, gKdbar, gMbar : ion channel reference maximal conductance parameters
     RANGE gLeak_t, gNabar_t, gKdbar_t, gMbar_t : ion channel maximal conductance variables
     RANGE gNaKPump, gNaKPump_t : NaK pump parameters and variables 
-    RANGE gKT, gKT_t : KT parameters and variables
+    RANGE EKT, gKT, gKT_t : KT parameters and variables
 }
 
 PARAMETER {
@@ -37,10 +38,13 @@ PARAMETER {
     gMbar = 7.5e-05 (S/cm2) : Maximal conductance of iM (at 36 deg. C)
     TauMax = 608 (ms) : Max. adaptation decay of slow non-inactivating Potassium current (at 36 deg. C)
 
-    : Baseline and stimulus drive parameters
-    ibaseline = 0 (mA/cm2) : baseline current (e.g. thalamic drive)
-    gamma = 0 : depolarizing force (mA/cm2) per stimulus intensity unit 
-    I = 0 : time-varying stimulus intensity (t.b.d.)
+    : Stimulus parameters
+    I = 0 : time-varying stimulus intensity (a.u.)
+
+    : Stimulus-driven current parameters
+    iStimbar = 0 (mA/cm2)  : maximal stimulus-driven current amplitude (mA/cm2)
+    iStimx0 = 200  : stimulus intensity yelding half-maximum stimulus-driven current amplitude (a.u.)
+    iStimdx = 100  : stimulus intensity range over which stimulus-driven current increases (a.u.)
 
     : Thermal model parameters
     Tref = 36  : reference temperature (in deg. C)
@@ -86,8 +90,8 @@ ASSIGNED {
     iM (mA/cm2)
     iKT (mA/cm2)
 
-    : Time-varying artificial drive current
-    idrive (mA/cm2)
+    : Stimulus-driven current
+    iStim (mA/cm2)
 
     : Time-varying ion channel conductances
     gNabar_t (S/cm2)
@@ -167,6 +171,11 @@ FUNCTION phi(T, Q) {
     phi = Q^((T - Tref) / 10)
 } 
 
+FUNCTION sig(x, x0, dx) {
+    : Generic sigmoid function, with inflexion point and with parameters
+    sig = 1 / (1 + exp(-(x - x0) / dx))
+}
+
 INITIAL {
     : Initial ion channel gating states
     m = alpham(v) / (alpham(v) + betam(v))
@@ -190,8 +199,10 @@ BREAKPOINT {
     gNaKPump_t = gNaKPump * phi(T, Q10_gNaK)
     gKT_t = gKT * (T - Tref)
 
+    : Stimulus-driven current computation
+    iStim = - iStimbar * sig(I, iStimx0, iStimdx)
+
     : Membrane currents computation
-    idrive = -(gamma * I + ibaseline)  : drive current = stimulus-driven current + baseline current
     iNa = gNabar_t * m * m * m * h * (v - ENa)
     iKd = gKdbar_t * n * n * n * n * (v - EK)
     iM = gMbar_t * p * (v - EK)
