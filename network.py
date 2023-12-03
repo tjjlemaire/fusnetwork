@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-12-01 18:24:25
+# @Last Modified time: 2023-12-03 16:53:01
 
 import itertools
 from tqdm import tqdm
@@ -89,6 +89,8 @@ class NeuralNetwork:
     NODE_KEY = 'node'
     REP_KEY = 'rep'
     RESP_KEY = 'ΔFR/FR'
+    ISPPA_KEY = 'Isppa (W/cm2)'
+    DUR_KEY = 'dur (ms)'
 
     # Dictionary of variables to record during simulation (besides time), by category
     record_dict = {
@@ -740,8 +742,13 @@ class NeuralNetwork:
         :param data: multi-indexed simulation output dataframe
         :return: 1D time vector (ms)
         '''
-        itime = data.index.names.index(cls.TIME_KEY)
-        return data.index.levels[itime].values  # ms
+        if isinstance(data.index, pd.MultiIndex):
+            itime = data.index.names.index(cls.TIME_KEY)
+            return data.index.levels[itime].values  # ms
+        else:
+            if data.index.name != cls.TIME_KEY:
+                raise ValueError(f'cannot extract time: data index = {data.index.name}')
+            return data.index.values
     
     @classmethod
     def extract_var(cls, data, key):
@@ -1082,6 +1089,17 @@ class NeuralNetwork:
         :param metric: metric name
         :return: array(s) of metric value per node
         '''
+        # If input data has extra dimensions, group by these extra dims
+        # and compute metric across groups
+        gby = [k for k in data.index.names if k not in (self.NODE_KEY, self.TIME_KEY)]
+        if len(gby) > 0:
+            if len(gby) == 1:
+                gby = gby[0]
+            mdict = {}
+            for gkey, gdata in data.groupby(gby):
+                mdict[gkey] = self.compute_metric(gdata.droplevel(gby), metric)
+            return pd.concat(mdict.values(), axis=0, keys=mdict.keys(), names=as_iterable(gby))
+
         # Extract time vecotr from data
         t = self.extract_time(data) # ms
 
@@ -1220,7 +1238,7 @@ class NeuralNetwork:
         # Plot stimulus time-course per node
         if hasstim:
             axrow = axes[irow]
-            axrow[0].set_ylabel('Isppa (W/cm2)')
+            axrow[0].set_ylabel(self.ISPPA_KEY)
             for ax, (_, stim) in zip(axrow, data[self.STIM_KEY].groupby(self.NODE_KEY)):
                 stim.droplevel(self.NODE_KEY).plot(ax=ax, c='k')
             axrow[-1].legend(**leg_kwargs)
@@ -1377,9 +1395,10 @@ class NeuralNetwork:
         self.verbose = vb
 
         # Concatenate data with new sweep index level, and return
-        return pd.concat(data, keys=Isppas, names=['Isppa (W/cm2'], axis=0)
+        return pd.concat(data, keys=Isppas, names=[self.ISPPA_KEY], axis=0)
     
-    def plot_sweep_results(self, data, metric, title=None, ax=None, width=4, height=2, legend=True):
+    def plot_sweep_results(self, data, metric, title=None, ax=None, width=4, height=2, legend=True,
+                           estimator='mean', errorbar='se'):
         '''
         Plot results of a sweep.
         
@@ -1387,25 +1406,32 @@ class NeuralNetwork:
         :param metric: metric(s) to plot
         :param title: optional figure title (default: None)
         :param ax: optional axis handle (default: None)
+        :param width: figure width (default: 4)
+        :param height: figure height (default: 2)
         :param legend: whether to add a legend to the graph(s)
+        :param estimator: estimator for the central tendency (default: 'mean').
+        :param errorbar: estimator for the error bars (default: 'se')
         :return: figure handle
         '''
         # If multiple metrics provided, recursively call function for each metric
-        if isinstance(metric, (tuple, list)) and len(metric) > 1:
-            # Create figure
-            nmetrics = len(metric)
-            fig, axes = plt.subplots(nmetrics, 1, figsize=(width, height * nmetrics), sharex=True)
-            if title is not None:
-                fig.suptitle(title)
+        if isinstance(metric, (tuple, list)):
+            if len(metric) > 1:
+                # Create figure
+                nmetrics = len(metric)
+                fig, axes = plt.subplots(nmetrics, 1, figsize=(width, height * nmetrics), sharex=True)
+                if title is not None:
+                    fig.suptitle(title)
 
-            # Plot each metric on a separate axis
-            for ax, m in zip(axes, metric):
-                self.plot_sweep_results(data, m, ax=ax, legend=legend)
-                legend = False
-            
-            # Return figure
-            return fig
-        
+                # Plot each metric on a separate axis
+                for ax, m in zip(axes, metric):
+                    self.plot_sweep_results(data, m, ax=ax, legend=legend)
+                    legend = False
+                
+                # Return figure
+                return fig
+            else:
+                metric = metric[0]
+
         # Create figure and axis, if not provided
         if ax is None:
             fig, ax = plt.subplots(figsize=(width, height))
@@ -1413,82 +1439,72 @@ class NeuralNetwork:
             fig = ax.get_figure()
         sns.despine(ax=ax)
 
-        # If data has too many dimensions, raise error
-        if data.index.ndim > 4:
-            raise ValueError('Cannot plot sweep results with more than 4 dimensions')
+        # Compute metric across nodes and all other dimensions
+        mdata = self.compute_metric(data, metric)
 
-        # Extract sweep key, and possible extra dimension key
-        idxnames = list(data.index.names)
-        hasrep = self.REP_KEY in idxnames
-        if hasrep:
-            irep = idxnames.index(self.REP_KEY)
-            del idxnames[irep]
-        sweepkey = idxnames[-3]
-        if len(idxnames) > 3:
-            extrakey = idxnames[0]
-        else:
-            extrakey = None
-
-        # Assemble grouping keys
-        gby = sweepkey
-        if extrakey is not None:
-            gby = [gby, extrakey]
-        if hasrep:
-            if isinstance(gby, list):
-                gby.append(self.REP_KEY)
-            else:
-                gby = [gby, self.REP_KEY]
-
-        # Compute metric across nodes and sweep values
-        msweep = []
-        keys = []
-        for gkey, gdata in data.groupby(gby):
-            m = self.compute_metric(gdata.droplevel(gby), metric)
-            msweep.append(m)
-            keys.append(gkey)
-        msweep = pd.concat(msweep, axis=0, keys=keys, names=as_iterable(gby))
+        # Extract index dimensions other than "node" and "repetition"
+        extradims = [k for k in mdata.index.names if k not in (self.NODE_KEY, self.REP_KEY)]
+        
+        # If no extra dimension, raise error
+        if len(extradims) == 0:
+            raise ValueError('Cannot plot sweep results with no extra grouping dimension')
+        # If 1 extra dimension, extract sweep key and set extra dimension key to None
+        elif len(extradims) == 1:
+            sweepkey, extrakey = extradims[0], None
+        # If 2 extra dimensions, extract sweep key and extra dimension key
+        if len(extradims) == 2:
+            try:
+                idx = extradims.index(self.ISPPA_KEY)
+                sweepkey, extrakey = extradims[idx], extradims[1 - idx]
+            except ValueError:
+                extrakey, sweepkey = extradims
+        # If too many extra dimensions, raise error
+        elif len(extradims) > 2:
+            raise ValueError('Cannot plot sweep results with more than 2 extra grouping dimensions')
 
         # If relative change, convert to percentage
         if metric == self.RESP_KEY:
-            msweep = msweep * 100
+            mdata = mdata * 100
 
-        # If metric is dataframe, split mean and err columns
-        msweepvar = None
-        if isinstance(msweep, pd.DataFrame):
-            msweep, msweepvar = msweep['mean'].rename(metric), msweep
+        # If metric data is dataframe, extract mean column and store dataframe
+        mvar = None
+        if isinstance(mdata, pd.DataFrame):
+            mdata, mvar = mdata['mean'].rename(metric), mdata
         
         # Generate color palette
         colors = list(plt.get_cmap('tab10').colors)
-        nodes = msweep.index.get_level_values(self.NODE_KEY).unique()
+        nodes = mdata.index.get_level_values(self.NODE_KEY).unique()
         palette = dict(zip(nodes, colors))
 
         # Plot metric vs sweep variable
         sns.lineplot(
-            data=msweep.to_frame(), 
+            data=mdata.to_frame(), 
             ax=ax, 
             x=sweepkey,
             y=metric,
-            hue=self.NODE_KEY,
+            hue=self.NODE_KEY if len(nodes) > 1 else None,
             marker='o',
-            palette=palette,
-            errorbar='se',
+            palette=palette if len(nodes) > 1 else None,
+            estimator=estimator,
+            errorbar=errorbar,
             style=extrakey,
             legend=legend
         )
 
-        # If sweep variance is provided, plot it
-        if msweepvar is not None:
-            msweepvar['lb'] = msweepvar['mean'] - msweepvar['err']
-            msweepvar['ub'] = msweepvar['mean'] + msweepvar['err']
+        # If sweep variance is provided
+        if mvar is not None:
+            # Compute lower and upper bounds from mean and err columns
+            mvar['lb'] = mvar['mean'] - mvar['err']
+            mvar['ub'] = mvar['mean'] + mvar['err']
             gby = self.NODE_KEY
             if extrakey is not None:
                 gby = [gby, extrakey]
-            if hasrep:
+            if 'rep' in mvar.index.names:
                 if isinstance(gby, list):
                     gby.append(self.REP_KEY)
                 else:
                     gby = [gby, self.REP_KEY]
-            for glabel, gdata in msweepvar.groupby(gby):
+            for glabel, gdata in mvar.groupby(gby):
                 if isinstance(glabel, tuple):
                     glabel = glabel[0]
                 ax.fill_between(
@@ -1496,7 +1512,7 @@ class NeuralNetwork:
                     fc=palette[glabel], ec=None, alpha=0.3)
 
         # Move legend outside of plot, if any
-        if legend:
+        if ax.get_legend() is not None:
             sns.move_legend(
                 ax,
                 bbox_to_anchor=(1.0, .5),
@@ -1535,7 +1551,7 @@ class NeuralNetwork:
         # If input is an array, format as series
         if isinstance(Isppa, (tuple, list, np.ndarray)):
             iStim = pd.Series(iStim, index=Isppa, name='iStim (mA/cm2)')
-            iStim.index.name = 'Isppa (W/cm2)'
+            iStim.index.name = self.ISPPA_KEY
 
         # Return
         return iStim
@@ -1567,10 +1583,13 @@ class NeuralNetwork:
         c1 = -self.tauT_abs * np.log((ΔTinf))
         Tmax = Tinf - np.exp(-(dur + c1) / self.tauT_abs)
 
-        # If input is an array, format as series
+        # If Isppa or duration is an array, format as series
         if isinstance(Isppa, (tuple, list, np.ndarray)):
             Tmax = pd.Series(Tmax, index=Isppa, name='Tmax (°C)')
-            Tmax.index.name = 'Isppa (W/cm2)'
+            Tmax.index.name = self.ISPPA_KEY
+        if isinstance(dur, (tuple, list, np.ndarray)):
+            Tmax = pd.Series(Tmax, index=dur, name='Tmax (°C)')
+            Tmax.index.name = self.DUR_KEY
 
         # Return
         return Tmax
@@ -1597,25 +1616,44 @@ class NeuralNetwork:
         # Return
         return iKTmax
     
-    def plot_EI_imbalance(self, Isppa, ax=None, style=None, **kwargs):
+    def compute_EI_currents(self, Isppa, dur=None):
+        '''
+        Compute excitatory and inhibitory currents for a given stimulus intensity
+
+        :param Isppa: stimulus intensity (W/cm2)
+        :return: dataframe of excitatory and inhibitory currents (mA/cm2)
+        '''
+        # If duration not provided, use class attribute
+        if dur is None:
+            if self.dur is None:
+                raise ValueError('No stimulus duration defined')
+            dur = self.dur
+
+        # Compute stimulus-driven and thermally-activated currents amplitude
+        # over Isppa range
+        return pd.concat([
+            self.compute_istim(Isppa),  # stimulus-driven current
+            self.compute_iKTmax(Isppa, dur=dur),  # thermally-activated current at end of stimulus
+            self.compute_iKTmax(Isppa, dur=dur / 2).rename('iKT1/2 (mA/cm2)'),  # thermally-activated current at half stimulus duration
+        ], axis=1)
+    
+    def plot_EI_imbalance(self, Isppa, ax=None, style=None, add_Pmap=True, legend=True, **kwargs):
         '''
         Plot the imbalance between excitatory and inhibitory currents 
         over a range of stimulus intensities.
 
         :param Isppa: stimulus intensity (W/cm2)
         :param ax: optional axis handle (default: None)
+        :param style: optional plotting style (default: None)
+        :param add_Pmap: whether to add x-axis with pressure values mapped to input Isspa values (default: False)
         :return: figure handle
         '''
-        # Compute stimulus-driven and thermally-activated currents amplitude
-        # over Isppa range
-        df = pd.concat([
-            self.compute_istim(Isppa),
-            self.compute_iKTmax(Isppa)
-        ], axis=1)
+        # Compute excitatory and inhibitory currents over Isppa range, and 
+        # convert to absolute values
+        df = self.compute_EI_currents(Isppa, **kwargs).abs()
 
-        # Remove units from currents names, and convert to absolute values
-        df.columns = df.columns.str.rstrip('(mA/cm2)')
-        df = df.abs()
+        # Remove units from currents names
+        df.columns = df.columns.str.rstrip('(mA/cm2)').str.rstrip(' ')
 
         # Create / retrieve figure and axis
         if ax is None:
@@ -1626,7 +1664,25 @@ class NeuralNetwork:
 
         # Plot currents
         ax.set_ylabel('|I| (mA/cm2)')
-        df.plot(ax=ax, style=style)
+        colors = {
+            'iStim': ('C0', '-'),
+            'iKTmax': ('C1', '-'),
+            'iKT1/2': ('C1', '--'),
+        }
+        for k, (c, ls) in colors.items():
+            df[k].plot(ax=ax, c=c, ls=ls, label=k)
+        if legend:
+            ax.legend(bbox_to_anchor=(1.0, .5), loc='center left', frameon=False)
+
+        # Add pressure axis, if requested
+        if add_Pmap:
+            ax2 = ax.twiny()
+            ax2.set_xlabel('P (MPa)')
+            ax2.set_xlim(ax.get_xlim())
+            Pmax = intensity_to_pressure(Isppa.max() * 1e4) * 1e-6  # MPa
+            Prange = np.arange(0, Pmax).astype(int)
+            ax2.set_xticks(pressure_to_intensity(Prange * 1e6) / 1e4)  # W/cm2
+            ax2.set_xticklabels(Prange)
 
         # Return
         return fig

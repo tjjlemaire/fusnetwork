@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-08-17 16:10:10
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-12-01 17:26:43
+# @Last Modified time: 2023-12-03 15:30:58
 
 ''' General utility functions. '''
 
@@ -24,6 +24,22 @@ def pressure_to_intensity(p, rho=1046.0, c=1546.3):
     :return: spatial peak, pulse average acoustic intensity (W/m2)
     '''
     return p**2 / (2 * rho * c)
+
+
+def intensity_to_pressure(I, rho=1046.0, c=1546.3):
+    '''
+    Return the pressure amplitude (in Pa) associated with the specified
+    spatial peak, pulse average acoustic intensity (ISPPA).
+    
+    Default values of dennsity and speed of sound are taken from the
+    IT'IS foundation database for brain tissue. 
+    
+    :param I: Isppa (W/m2)
+    :param rho: medium density (kg/m3)
+    :param c: speed of sound in medium (m/s)
+    :return: pressure amplitude (Pa)
+    '''
+    return np.sqrt(I * 2 * rho * c)
 
 
 def is_iterable(x):
