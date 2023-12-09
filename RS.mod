@@ -172,8 +172,13 @@ FUNCTION phi(T, Q) {
 } 
 
 FUNCTION sig(x, x0, dx) {
-    : Generic sigmoid function, with inflexion point and with parameters
+    : Generic sigmoid function, with inflexion point and width parameters
     sig = 1 / (1 + exp(-(x - x0) / dx))
+}
+
+FUNCTION exp_cdf(x, dx) {
+    : Exponential cumulative distribution function with scale parameter dx
+    exp_cdf = 1 - exp(-x / dx)
 }
 
 INITIAL {
@@ -200,7 +205,8 @@ BREAKPOINT {
     gKT_t = gKT * (T - Tref)
 
     : Stimulus-driven current computation
-    iStim = - iStimbar * sig(I, iStimx0, iStimdx)
+    : iStim = - iStimbar * (sig(I, iStimx0, iStimdx) - sig(0, iStimx0, iStimdx))
+    iStim = - iStimbar * exp_cdf(I, iStimdx)
 
     : Membrane currents computation
     iNa = gNabar_t * m * m * m * h * (v - ENa)

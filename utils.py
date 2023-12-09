@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-08-17 16:10:10
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-12-03 15:30:58
+# @Last Modified time: 2023-12-08 17:30:42
 
 ''' General utility functions. '''
 
@@ -63,3 +63,25 @@ def sigmoid(x, x0, dx):
 def sigmoid_root(y, x0, dx):
     ''' Inverse sigmoid function '''
     return x0 + dx * np.log(y / (1 - y))
+
+
+def exp_cdf(x, dx):
+    ''' Exponential cumulative distribution function '''
+    return 1 - np.exp(-x / dx)
+
+
+def is_within(x, bounds):
+    ''' Check if a value is within a given range '''
+    return np.logical_and(x >= bounds[0], x <= bounds[1])
+
+
+def signed_sqrt(x):
+    ''' Signed square root function. '''
+    if is_iterable(x):
+        return np.array([signed_sqrt(xi) for xi in x])
+    return np.sqrt(x) if x >= 0 else -np.sqrt(-x)
+
+
+def sqrtspace(start, stop, n):
+    ''' Generate range of values linearly spaced in sqrt space '''
+    return np.linspace(np.sqrt(start), np.sqrt(stop), n)**2
