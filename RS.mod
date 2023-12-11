@@ -17,7 +17,8 @@ NEURON {
 
     : Python-accessible parameters/variables
     RANGE I : stimulus parameters
-    RANGE iStimbar, iStimx0, iStimdx : stimulus-driven current parameters
+    : RANGE iStimbar, iStimx0, iStimdx : stimulus-driven current parameters
+    RANGE a, b :  stimulus-driven current parameters 
     RANGE Tref, alphaT, tauT_abs, tauT_diss  : thermal model parameters
     RANGE Q10_rates, Q10_gNa, Q10_gKd, Q10_gNaK  : temperature dependence parameters
     RANGE gLeak, gNabar, gKdbar, gMbar : ion channel reference maximal conductance parameters
@@ -41,10 +42,12 @@ PARAMETER {
     : Stimulus parameters
     I = 0 : time-varying stimulus intensity (a.u.)
 
-    : Stimulus-driven current parameters
-    iStimbar = 0 (mA/cm2)  : maximal stimulus-driven current amplitude (mA/cm2)
-    iStimx0 = 200  : stimulus intensity yelding half-maximum stimulus-driven current amplitude (a.u.)
-    iStimdx = 100  : stimulus intensity range over which stimulus-driven current increases (a.u.)
+    : : Stimulus-driven current parameters
+    : iStimbar = 0 (mA/cm2)  : maximal stimulus-driven current amplitude (mA/cm2)
+    : iStimx0 = 200  : stimulus intensity yelding half-maximum stimulus-driven current amplitude (a.u.)
+    : iStimdx = 100  : stimulus intensity range over which stimulus-driven current increases (a.u.)
+    a = 0.1 : multiplying factor to stimulus-intensity dependency
+    b = 0.1 : exponent to stimulus-intensity dependency
 
     : Thermal model parameters
     Tref = 36  : reference temperature (in deg. C)
@@ -206,7 +209,8 @@ BREAKPOINT {
 
     : Stimulus-driven current computation
     : iStim = - iStimbar * (sig(I, iStimx0, iStimdx) - sig(0, iStimx0, iStimdx))
-    iStim = - iStimbar * exp_cdf(I, iStimdx)
+    : iStim = - iStimbar * exp_cdf(I, iStimdx)
+    iStim = - a * I^b
 
     : Membrane currents computation
     iNa = gNabar_t * m * m * m * h * (v - ENa)

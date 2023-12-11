@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-12-09 16:56:09
+# @Last Modified time: 2023-12-11 14:37:43
 
 import itertools
 from tqdm import tqdm
@@ -125,6 +125,7 @@ class NeuralNetwork:
         },
         'currents': {
             'iDrive': 'driving current (mA/cm2)',
+            'iSyn': 'synaptic current (mA/cm2)',
             'iStim': 'stimulus-driven current (mA/cm2)',
             'iNa': 'sodium current (mA/cm2)',
             'iKd': 'potassium current (mA/cm2)',
@@ -136,7 +137,7 @@ class NeuralNetwork:
     }
 
     RECTIFIED_CURRENTS = ['iDrive', 'iNa', 'iStim']  # currents that should be rectified
-    CLIPPED_CURRENTS = ['iNa', 'iKd', 'iLeak', 'iDrive']  # currents that should be clipped upon plotting
+    CLIPPED_CURRENTS = ['iNa', 'iKd', 'iLeak', 'iDrive', 'iSyn', 'iM']  # currents that should be clipped upon plotting
 
     TIMEVAR_SUFFIX = '_t'  # suffix to add to time-varying conductance variables
 
@@ -256,6 +257,7 @@ class NeuralNetwork:
                 conkwargs['weight'] = synweight
             self.connect_nodes(**conkwargs)
         # Set model parameters, if provided
+        self.mech_params = {}
         self.set_mech_param(**kwargs)
         # Set default stimulus parameters and simulation duration to None
         self.start = None
@@ -263,6 +265,44 @@ class NeuralNetwork:
         self.tstop = None
         # Log initialization completion
         self.log('initialized')
+    
+    def copy(self, nnodes=None):
+        '''
+        Return a copy of the network.
+        
+        :param nnodes: number of nodes (default: None, i.e. same as original network)
+        :return: NeuralNetwork instance
+        '''
+        # If number of nodes not provided, use same as original network
+        if nnodes is None:
+            nnodes = self.size
+        
+        # Create new instance of the class
+        model = self.__class__(
+            nnodes, 
+            connect=self.is_connected(),
+            verbose=self.verbose,
+            **self.mech_params
+        )
+
+        # If connected, assign same synaptic weight parameter as original network
+        if self.is_connected():
+            model.set_synaptic_weight(self.get_synaptic_weight())
+        
+        # If drive is set, assign same pre-synaptic drive parameters as original network
+        if self.is_drive_set():
+            model.set_presyn_drive(**self.get_drive_params())
+        
+        # Assign same stimulus parameters as original network
+        model.start = self.start
+        model.dur = self.dur
+        model.tstop = self.tstop
+
+        # Assign same simulation parameters as original network
+        model.tstop = self.tstop
+
+        # Return new instance
+        return model
         
     def __repr__(self):
         ''' String representation. '''
@@ -313,8 +353,7 @@ class NeuralNetwork:
     def init_obj_lists(self):
         ''' Initialize containers to store NEURON objects for the model. '''
         self.drive_objs = [None] * self.size
-        self.syn_objs = None
-        self.netcon_objs = None
+        self.connections = None
     
     @property
     def size(self):
@@ -370,6 +409,9 @@ class NeuralNetwork:
         '''
         # Get default parameter value
         default_val = self.get_mech_param(key)
+
+        # Assign value to dictionary of mechanism parameters
+        self.mech_params[key] = value
 
         # If value no different than default, return
         if value == default_val:
@@ -595,46 +637,52 @@ class NeuralNetwork:
         nc.delay = 1.  # synaptic delay (ms)
         nc.weight[0] = self.to_absolute_conductance(weight)  # synaptic weight (uS)
 
-        # Append synapse and netcon objects to network class atributes 
-        self.syn_objs.append(syn)
-        self.netcon_objs.append(nc)
+        # Append synapse and netcon objects to connections atribute 
+        self.connections[ipresyn, ipostsyn] = (syn, nc)
     
     def connect_nodes(self, **kwargs):
         ''' Form all specific connections between network nodes '''
         self.log('connecting all node pairs')
-        self.syn_objs = []
-        self.netcon_objs = []
+        self.connections = np.full((self.size, self.size), None)
         for pair in itertools.combinations(range(self.size), 2):
             self.connect(*pair, **kwargs)
             self.connect(*pair[::-1], **kwargs)
     
     def is_connected(self):
         ''' Return whether network nodes are connected. '''
-        return hasattr(self, 'netcon_objs') and self.netcon_objs is not None
+        return hasattr(self, 'connections') and self.connections is not None
     
     def disconnect_nodes(self):
         ''' Clear all synapses and network connection objects between nodes '''
-        logger.info(f'removing all {len(self.netcon_objs)} connections between nodes')
-        self.syn_objs = None
-        self.netcon_objs = None
+        logger.info('removing all connections between nodes')
+        self.connections = None
     
     def set_synaptic_weight(self, w):
         ''' Set synaptic weight on all connections. '''
         if not self.is_connected():
             raise ValueError('Network nodes are not connected')
         self.log(f'setting all synaptic weights to {w:.2e} S/cm2')
-        for nc in self.netcon_objs:
-            nc.weight[0] = self.to_absolute_conductance(w)  # synaptic weight (uS)
+        for con in np.ravel(self.connections):
+            if con is not None:
+                con[1].weight[0] = self.to_absolute_conductance(w)  # synaptic weight (uS)
     
     def get_synaptic_weight(self):
         ''' Return synaptic weight on all connections. '''
         if not self.is_connected():
             raise ValueError('Network nodes are not connected')
-        return self.to_relative_conductance(self.netcon_objs[0].weight[0])
- 
-    def get_vector_list(self):
-        ''' Return model-sized list of NEURON vectors. '''
-        return [h.Vector() for node in self.nodes]
+        for con in np.ravel(self.connections):
+            if con is not None:
+                return self.to_relative_conductance(con[1].weight[0])
+        raise ValueError('No synaptic weight found')
+    
+    @staticmethod
+    def get_probe(var):
+        '''
+        Return a NEURON vector probe for a specific variable.
+        '''
+        probe = h.Vector()
+        probe.record(var)
+        return probe    
     
     def get_var_ref(self, inode, varname):
         ''' 
@@ -679,13 +727,29 @@ class NeuralNetwork:
         # to define variable key
         varkey = varname.rstrip(self.TIMEVAR_SUFFIX)
 
-        # Initialize recording probes list for variable
-        self.probes[varkey] = self.get_vector_list()
+        # If variable is synaptic current
+        if varname == 'iSyn':
+            logger.debug(f'recording all synaptic currents')
+            # Initialize recording probes list for synaptic currents
+            self.probes[varkey] = []
+            # For each post-synaptic node
+            for ipostnode in range(self.size):
+                plist = []
+                # For each pre-synaptic node
+                for iprenode in range(self.size):
+                    # If connection exists
+                    if self.connections[iprenode, ipostnode] is not None:
+                        # record synaptic current
+                        plist.append(
+                            self.get_probe(self.connections[iprenode, ipostnode][0]._ref_i))
+                self.probes[varkey].append(plist)
 
-        # Record variable on all nodes
-        logger.debug(f'recording "{varname}" on all nodes with key "{varkey}"')
-        for inode in range(self.size):
-            self.probes[varkey][inode].record(self.get_var_ref(inode, varname))
+        # Otherwise
+        else:
+            # Record variable on all nodes
+            logger.debug(f'recording "{varname}" on all nodes with key "{varkey}"')
+            self.probes[varkey] = [
+                self.get_probe(self.get_var_ref(inode, varname)) for inode in range(self.size)]
     
     def get_disabled_currents(self):
         ''' 
@@ -780,8 +844,15 @@ class NeuralNetwork:
         dfout = pd.DataFrame()
 
         for k, v in self.probes.items():
-            # Extract 2D array of variable time course across nodes
-            vpernode = np.array([x.to_python() for x in v])
+            if k == 'iSyn':
+                # Extract 2D array of sum of synaptic current time course across nodes
+                vpernode = np.zeros((self.size, len(t)))
+                for ipost, probes in enumerate(v):
+                    vpres = np.array([x.to_python() for x in probes])
+                    vpernode[ipost] = np.sum(vpres, axis=0)
+            else:
+                # Extract 2D array of variable time course across nodes
+                vpernode = np.array([x.to_python() for x in v])
 
             # If probe recorded absolute current, convert to current density
             if k == 'iDrive':
@@ -1071,6 +1142,7 @@ class NeuralNetwork:
             cvode.active(0)
         else:
             cvode.active(1)
+            cvode.maxstep(5)
 
         # Run simulation
         self.log(f'simulating for {self.tstop:.2f} ms')
@@ -1558,12 +1630,26 @@ class NeuralNetwork:
                             bounds_per_ax[iax, 0] = min(bounds_per_ax[iax, 0], s.min())
                             bounds_per_ax[iax, 1] = max(bounds_per_ax[iax, 1], s.max())
                     ncurrs += 1
+            
+            # If currents clipping requested
             if clip_currents:
-                range_per_ax = np.squeeze(np.diff(bounds_per_ax, axis=1))
-                exp_factor = 0.1
-                exp_bounds_per_ax = np.array([bounds_per_ax[:, 0] - range_per_ax * exp_factor, bounds_per_ax[:, 1] + range_per_ax * exp_factor]).T
-                for ax, bounds in zip(axrow, exp_bounds_per_ax):
-                    ax.set_ylim(*bounds)
+                # Compute min and max across axes
+                ybounds = np.array([bounds_per_ax[:, 0].min(), bounds_per_ax[:, 1].max()])
+                yrange = np.diff(ybounds)[0]
+
+                # If y range is non-zero
+                if yrange > 0:
+                    # Add relative margin to y-axis bounds
+                    exp_factor = 0.1
+                    exp_ybounds = np.array([ybounds[0] - yrange * exp_factor, ybounds[1] + yrange * exp_factor])
+
+                    # Set y-bounds to be symmetric around 0
+                    if exp_ybounds[0] * exp_ybounds[1] < 0:
+                        exp_ybounds = np.array([-max(np.abs(exp_ybounds)), max(np.abs(exp_ybounds))])
+
+                    # Apply to first axis (sharey should adjust other axes)
+                    axrow[0].set_ylim(*exp_ybounds)
+            
             axrow[-1].legend(ncols=int(np.ceil(ncurrs / 4)), **leg_kwargs)
             irow += 1
 
@@ -1640,11 +1726,9 @@ class NeuralNetwork:
         :param kind: stimulus distribution kind (default: 'uniform'). One of:
             - "single": single node stimulated
             - "uniform": all nodes stimulated with equal intensity
-        '''
-        # Check that stimulus distribution kind is valid
-        if kind not in ['single', 'uniform']:
-            raise ValueError(f'Invalid stimulus distribution kind: {kind}')
-        
+            - integer: custom number of nodes stimulated with equal intensity
+        :return: stimulus distribution vector
+        '''        
         # Return stimulus distribution vector
         if kind == 'single':
             x = np.zeros(self.size)
@@ -1652,6 +1736,14 @@ class NeuralNetwork:
             return x
         elif kind == 'uniform':
             return np.ones(self.size)
+        elif isinstance(kind, int):
+            if kind > self.size:
+                raise ValueError(f'Number of stimulated nodes ({kind}) cannot exceed number of nodes ({self.size})')
+            x = np.zeros(self.size)
+            x[:kind] = 1.
+            return x 
+        else:
+            raise ValueError(f'Invalid stimulus distribution kind: {kind}')
     
     def get_stimdists(self):
         '''
@@ -1716,8 +1808,8 @@ class NeuralNetwork:
         return self.concatenate_outputs(Isppas, data, self.ISPPA_KEY)
     
     def plot_sweep_results(self, data, metric=None, title=None, ax=None, width=4, height=2, 
-                           legend=True, estimator='median', errorbar='se', Pmap='full', 
-                           xscale='linear'):
+                           legend=True, marker='o', markersize=4, lw=1, 
+                           estimator='median', errorbar='se', Pmap='full', xscale='linear'):
         '''
         Plot results of a sweep.
         
@@ -1822,7 +1914,9 @@ class NeuralNetwork:
             x=sweepkey,
             y=metric,
             hue=self.NODE_KEY if len(nodes) > 1 else None,
-            marker='o',
+            marker=marker,
+            markersize=markersize,
+            linewidth=lw,
             palette=palette if len(nodes) > 1 else None,
             estimator=estimator,
             errorbar=errorbar,
@@ -1892,7 +1986,8 @@ class NeuralNetwork:
         :return: stimulus-driven current amplitude (mA/cm2)
         '''
         # Compute stimulus-driven current amplitude over Isppa range
-        iStim = -self.iStimbar * exp_cdf(Isppa, self.iStimdx)
+        # iStim = -self.iStimbar * exp_cdf(Isppa, self.iStimdx)
+        iStim = -self.a * np.power(Isppa, self.b)
 
         # If input is an array, format as series
         if isinstance(Isppa, (tuple, list, np.ndarray)):
@@ -2104,6 +2199,9 @@ class NeuralNetwork:
             - "symlog"
             - "sqrt"
         '''
+        if scale is None:
+            return
+        
         # If multiple keys, recursively call function for each key
         if len(key) > 1:
             for k in key:
@@ -2168,19 +2266,25 @@ class NeuralNetwork:
         else:
             ax2.set_xticklabels([])
     
-    def run_comparative_sweep(self, Isppas, metric, **kwargs):
+    def run_comparative_sweep(self, Isppas, metric, stimdists=None, **kwargs):
         '''
         Compute metric over Isppa sweep for both single node and uniform stimulus distributions,
 
         :param Isppas: stimulus intensity vector (W/cm2)
         :param metric: name of metric to compute
+        :param stimdists (optional): stimulus distribution vector(s) (default: None). If not provided,
+            both single node and uniform distributions will be used.
         :return: multi-indexed metric dataframe
         '''
+        # If stimulus distribution vectors not provided, use default ones
+        if stimdists is None:
+            stimdists = self.get_stimdists()
+
         # Initialize lists of stimulus distribution keys and metric results
         mdata, kinds = [], []
         
         # For each stimulus distribution
-        for kind, dist in self.get_stimdists().items():
+        for kind, dist in stimdists.items():
             # Run sweep over stimulus intensities, 
             data = self.run_stim_sweep(Isppas, stimdist=dist, **kwargs)
             # Compute metric, and append to list
@@ -2190,3 +2294,115 @@ class NeuralNetwork:
 
         # Concatenate metric results and return
         return self.concatenate_outputs(kinds, mdata, 'stim dist.')
+
+    def explore2D(self, wrange, arange, Isppa_range, title=None, **kwargs):
+        '''
+        Explore 2D parameter space of synaptic weight and stimulus sensitivity.
+        
+        :param wrange: synaptic weight range (S/cm2)
+        :param arange: stimulus sensitivity range (-)
+        :param Isppa_range: range of intensities to sweep (W/cm2)
+        :param title: figures title
+        :return: figure handles
+        '''
+        # Initialize metric container
+        metric = []
+
+        # Create figure to plot E/I imbalance profiles
+        EIfig, EIaxes = plt.subplots(1, len(arange), figsize=(2.5 * len(arange), 1.5), sharex=True, sharey=True)
+        xscale = 'sqrt'
+
+        # For each stimulus sensitivity value
+        for a, EIax in zip(arange, EIaxes):
+            # Set stimulus sensitivity parameter
+            self.set_mech_param(a=a)
+            self.plot_EI_imbalance(Isppa_range.max(), ax=EIax, legend=EIax is EIaxes[-1], xscale=xscale)
+            EIax.set_title(f'a = {a:.2e}', fontsize=10)
+            xscale = None
+
+            # For each synaptic weight value
+            for w in wrange:
+                # Set synaptic weight parameter
+                self.set_synaptic_weight(w)
+
+                # Run comparative Isppa sweep for each stimulus distribution, compute metric
+                # and append to container
+                metric.append(
+                    self.run_comparative_sweep(Isppa_range, 'nspikes', **kwargs))
+
+        # Concatenate results
+        metric = self.concatenate_outputs(
+            list(itertools.product(arange, wrange * 1e6)), 
+            metric, 
+            ['a', 'w (uS/cm2)']
+        )
+
+        # Plot Isppa dependencies
+        logger.info('plotting Isppa dependencies...')
+        fg = sns.FacetGrid(
+            metric.reset_index(),
+            row='w (uS/cm2)',
+            col='a',
+            aspect=1.3,
+            height=2,
+            sharex=False,
+            sharey=False,
+        )
+        fg.set_titles('a={col_name:.2e}, w={row_name:.0f}uS/cm2')
+        for iw, w in enumerate(wrange):
+            for ix, a in enumerate(arange):
+                self.plot_sweep_results(
+                    metric.loc[a, w * 1e6],
+                    ax=fg.axes[iw, ix], 
+                    legend=iw == wrange.size // 2 and ix == arange.size - 1,
+                    xscale='sqrt',
+                    marker=None,
+                )
+        sweepfig = fg.figure
+        sweepfig.tight_layout()
+        for ax in sweepfig.axes:
+            ax.set_title(ax.get_title(), fontsize=9)
+
+        # Add title
+        if title is not None:
+            EIfig.suptitle(title, y=1.5, fontsize=12)
+            sweepfig.suptitle(title, y=1.02, fontsize=12)
+        
+        # Return figure handles
+        return EIfig, sweepfig
+    
+    def find_threshold(self, s, value=1, agg='max', side='sub'):
+        ''' 
+        Find threshold Isppa value where metric reaches a critical level
+        
+        :param s: metric pandas Series
+        :param value: critical metric level
+        :param agg: method used to aggregate matric across ndoes prior to threshold computation
+        :param side: string indicating whether to return the just sub-threshold value ("sub"),
+            just supra-threshold value ("supra"), or a mid-point between the two ("mid")
+        :return: threshold Isppa value
+        '''
+        if side == 'mid':
+            tsub = self.find_threshold(s, value=value, agg=agg, side='sub')
+            tsupra = self.find_threshold(s, value=value, agg=agg, side='supra')
+            return (tsub + tsupra) / 2
+        # Compute cross-node aggregate metric
+        sagg = s.unstack(level='node').agg(agg, axis=1)
+
+        # Select only sub-threshold or supra-threshold values, depending on "side" argument
+        if side == 'sub':
+            sagg = sagg[sagg < value]
+        elif side == 'supra':
+            sagg = sagg[sagg >= value]
+        else:
+            raise ValueError(f'Invalid value for "side" argument: {side}')
+        
+        # Group data across all non-intensity dimensions, and extract 
+        # max or min Isppa value for each group
+        Isppas = sagg.reset_index(level=self.ISPPA_KEY)[self.ISPPA_KEY]
+        gby = [k for k in sagg.index.names if k != self.ISPPA_KEY]
+        groups = Isppas.groupby(gby)
+        threshs = groups.max() if side == 'sub' else groups.min()
+
+        # Return
+        return threshs
