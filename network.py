@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-12-12 17:09:29
+# @Last Modified time: 2023-12-12 21:29:54
 
 import itertools
 from tqdm import tqdm
@@ -796,7 +796,9 @@ class NeuralNetwork:
                     gkey,   # conductance key
                     f'i{gkey[1:]}'.rstrip('bar')   # current key
                 ))
+        self.verbose = False
         self.log(f'disabled currents: {", ".join([ikey for _, ikey in l])}')
+        self.verbose = True
         is_drive_set = self.is_drive_set()
         if isinstance(is_drive_set, list):
             is_drive_set = all(is_drive_set)
@@ -1317,7 +1319,7 @@ class NeuralNetwork:
             h.fadvance()
         
         # Extract dataframe of recorded continous variables 
-        self.log('extracting output results')
+        # self.log('extracting output results')
         data = self.extract_continous_variables()
         
         # If stimulus is set, interpolate stimulus waveforms along simulation time vector
@@ -1336,20 +1338,20 @@ class NeuralNetwork:
             events = self.extract_presyn_events()
             data = (data, events)
 
-        # Compute and log max temperature increase per node
-        ΔT = self.compute_metric(data, 'ΔT')
-        self.log(f'max temperature increase:\n{self.vecstr(ΔT, prefix="ΔT =", suffix="°C")}')
+        # # Compute and log max temperature increase per node
+        # ΔT = self.compute_metric(data, 'ΔT')
+        # self.log(f'max temperature increase:\n{self.vecstr(ΔT, prefix="ΔT =", suffix="°C")}')
         
-        # Count number of spikes and average firing rate per node
-        nspikes = self.compute_metric(data, 'nspikes')
-        self.log(f'number of spikes:\n{self.vecstr(nspikes, prefix="n =", suffix="spikes")}')
-        FRs = self.compute_metric(data, 'FR')
-        self.log(f'firing rate:\n{self.vecstr(FRs, prefix="FR =", suffix="Hz")}')
+        # # Count number of spikes and average firing rate per node
+        # nspikes = self.compute_metric(data, 'nspikes')
+        # self.log(f'number of spikes:\n{self.vecstr(nspikes, prefix="n =", suffix="spikes")}')
+        # FRs = self.compute_metric(data, 'FR')
+        # self.log(f'firing rate:\n{self.vecstr(FRs, prefix="FR =", suffix="Hz")}')
 
-        # Compute number of non-artificial spikes per node
-        if self.is_drive_set():
-            nspikes_evoked = self.compute_metric(data, 'nspikes_evoked')
-            self.log(f'number of non-artificial spikes:\n{self.vecstr(nspikes_evoked, prefix="n =", suffix="spikes")}')
+        # # Compute number of non-artificial spikes per node
+        # if self.is_drive_set():
+        #     nspikes_evoked = self.compute_metric(data, 'nspikes_evoked')
+        #     self.log(f'number of non-artificial spikes:\n{self.vecstr(nspikes_evoked, prefix="n =", suffix="spikes")}')
 
         # # If stimulus is set, compute stimulus-evoked response
         # if self.is_stim_set():

@@ -1,3 +1,7 @@
+### General ###
+*.pdf
+figures/
+
 ### NEURON ###
 
 x86_64/
