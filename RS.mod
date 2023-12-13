@@ -18,7 +18,7 @@ NEURON {
     : Python-accessible parameters/variables
     RANGE I : stimulus parameters
     : RANGE iStimbar, iStimx0, iStimdx : stimulus-driven current parameters
-    RANGE a, b :  stimulus-driven current parameters 
+    RANGE a, b :  stimulus-driven current parameters
     RANGE Tref, alphaT, tauT_abs, tauT_diss  : thermal model parameters
     RANGE Q10_rates, Q10_gNa, Q10_gKd, Q10_gNaK  : temperature dependence parameters
     RANGE gLeak, gNabar, gKdbar, gMbar : ion channel reference maximal conductance parameters
@@ -46,8 +46,8 @@ PARAMETER {
     : iStimbar = 0 (mA/cm2)  : maximal stimulus-driven current amplitude (mA/cm2)
     : iStimx0 = 200  : stimulus intensity yelding half-maximum stimulus-driven current amplitude (a.u.)
     : iStimdx = 100  : stimulus intensity range over which stimulus-driven current increases (a.u.)
-    a = 0.1 : multiplying factor to stimulus-intensity dependency
-    b = 0.1 : exponent to stimulus-intensity dependency
+    a = 0 : multiplying factor to stimulus-intensity dependency
+    b = 1 : exponent to stimulus-intensity dependency
 
     : Thermal model parameters
     Tref = 36  : reference temperature (in deg. C)

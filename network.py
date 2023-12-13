@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-12-11 14:37:43
+# @Last Modified time: 2023-12-12 17:09:29
 
 import itertools
 from tqdm import tqdm
@@ -100,6 +100,7 @@ class NeuralNetwork:
     
     mechname = 'RS'  # NEURON mechanism name
     vrest = -71.9  # neurons resting potential (mV)
+    DEFAULT_DT = 0.025  # default integration time step (ms)
 
     TIME_KEY = 'time (ms)'
     STIM_KEY = 'stim'
@@ -124,20 +125,21 @@ class NeuralNetwork:
             'gNaKPump': 'sodium-potassium pump conductance (uS/cm2)',
         },
         'currents': {
-            'iDrive': 'driving current (mA/cm2)',
-            'iSyn': 'synaptic current (mA/cm2)',
             'iStim': 'stimulus-driven current (mA/cm2)',
+            'iKT': 'thermally-driven Potassium current (uA/cm2)',
+            'iM': 'slow non-inactivating potassium current (mA/cm2)',
+            'iSyn': 'synaptic current (mA/cm2)',
+            'iDrive': 'driving current (mA/cm2)',
             'iNa': 'sodium current (mA/cm2)',
             'iKd': 'potassium current (mA/cm2)',
-            'iM': 'slow non-inactivating potassium current (mA/cm2)',
             'iLeak': 'leak current (mA/cm2)',
-            'iKT': 'thermally-driven Potassium current (uA/cm2)',
+            'iNoise': 'noise current (mA/cm2)',
             'iNaKPump': 'sodium-potassium pump current (mA/cm2)',
         },
     }
 
     RECTIFIED_CURRENTS = ['iDrive', 'iNa', 'iStim']  # currents that should be rectified
-    CLIPPED_CURRENTS = ['iNa', 'iKd', 'iLeak', 'iDrive', 'iSyn', 'iM']  # currents that should be clipped upon plotting
+    CLIPPED_CURRENTS = ['iNa', 'iKd', 'iLeak', 'iDrive', 'iSyn', 'iM', 'iNoise']  # currents that should be clipped upon plotting
 
     TIMEVAR_SUFFIX = '_t'  # suffix to add to time-varying conductance variables
 
@@ -232,37 +234,49 @@ class NeuralNetwork:
         allkeys = [k for k in allkeys if k not in toremove]
         return allkeys
 
-    def __init__(self, nnodes, connect=True, synweight=None, verbose=True, **kwargs):
+    def __init__(self, nnodes, connect=True, synweight=None, noise_amp=0., verbose=True, **kwargs):
         '''
         Initialize a neural network with a given number of nodes.
         
         :param nnodes: number of nodes
         :param connect: whether to connect nodes (default: True)
         :param synweight: synaptic weight (uS) (default: None)
+        :param noise_amp: noise amplitude (default: 0)
         :param verbose: verbosity flag (default: True)
         :param kwargs: model parameters passed as "key=value" pairs (optional)
         '''
         # Set verbosity
         self.verbose = verbose
+        
         # Create nodes
         self.create_nodes(nnodes)
+        
         # Set biophysics
         self.set_biophysics()
+        
         # Initialize empty containers for NEURON objects
         self.init_obj_lists()
+        
         # Connect nodes with appropriate synaptic weights, if requested
         if connect and nnodes > 1:
             conkwargs = {}
             if synweight is not None:
                 conkwargs['weight'] = synweight
             self.connect_nodes(**conkwargs)
+
         # Set model parameters, if provided
         self.mech_params = {}
         self.set_mech_param(**kwargs)
-        # Set default stimulus parameters and simulation duration to None
+
+        # Set default stimulus and simulation parameters to None
         self.start = None
         self.dur = None
         self.tstop = None
+        self.dt = None
+
+        # Set default noise amplitude
+        self.noise_amp = noise_amp
+
         # Log initialization completion
         self.log('initialized')
     
@@ -300,6 +314,10 @@ class NeuralNetwork:
 
         # Assign same simulation parameters as original network
         model.tstop = self.tstop
+        model.dt = self.dt
+
+        # Assign same noise amplitude as original network
+        model.noise_amp = self.noise_amp
 
         # Return new instance
         return model
@@ -473,6 +491,15 @@ class NeuralNetwork:
         :return: current density (mA/cm2)
         '''
         return I * self.NA_TO_MA / (self.Acell * self.UM_TO_CM**2)
+    
+    def to_current(self, i):
+        '''
+        Convert current density to current for compatibility with NEURON formalism.
+
+        :param i: current density (mA/cm2)
+        :return: absolute current (nA)
+        '''
+        return i / self.NA_TO_MA * (self.Acell * self.UM_TO_CM**2)
     
     def set_presyn_drive(self, inode=None, delay=0, weight=4.5e-4, sync=False, **kwargs):
         ''' 
@@ -743,6 +770,10 @@ class NeuralNetwork:
                         plist.append(
                             self.get_probe(self.connections[iprenode, ipostnode][0]._ref_i))
                 self.probes[varkey].append(plist)
+        
+        # If variable is noise current 
+        elif varname == 'iNoise':
+            pass
 
         # Otherwise
         else:
@@ -773,6 +804,8 @@ class NeuralNetwork:
             l.append(('iDrive',))
         if not self.is_stim_set():
             l.append(('iStim',))
+        if self.noise_amp == 0.:
+            l.append(('iNoise',))
         return l
     
     def get_disabled_keys(self):
@@ -1023,39 +1056,71 @@ class NeuralNetwork:
         stimvecs = np.array([y.to_python() for y in self.h_yvecs])
         return tvec, stimvecs
     
-    def interpolate_stim_vec(self, tstim, xstim, teval):
+    def interpolate_vector(self, t, y, teval):
         ''' 
-        Interpolate stimulus waveform along a set of evaluation times
+        Interpolate waveform along a set of evaluation times
         
-        :param tref: stimulus time vector (ms)
-        :param xstim: stimulus waveform vector
+        :param tref: time vector (ms)
+        :param y: waveform vector
         :param teval: evaluation time vector (ms)
         '''
         return interp1d(
-            tstim, xstim, 
+            t, y, 
             kind='previous', 
             bounds_error=False,
-            fill_value=(0., xstim[-1])
+            fill_value=(0., y[-1])
         )(teval)
+    
+    def interpolate_vectors(self, tvec, yvecs, teval):
+        ''' 
+        Interpolate waveforms along a set of evaluation times
+        
+        :param tvec: time vector (ms)
+        :param yvecs: waveform vectors
+        :param teval: evaluation time vector (ms)
+        :return: multi-indexed series storing the interpolated waveform time courses across nodes
+        '''
+        # Create output dataframe, indexed by time
+        df = pd.DataFrame(index=teval)
+        # For each node
+        for node, yvec in zip(self.nodelist, yvecs):
+            # Add column with interpolated waveform along evaluation time vector
+            df[node] = self.interpolate_vector(tvec, yvec, teval)
+        # Stack dataframe and return as series
+        return df.T.stack()
     
     def interpolate_stim_data(self, teval):
         '''
         Interpolate stimulus waveform along simulation time vector
 
         :param teval: evaluation time vector (ms)
-        :return: multi-indexed dataframe storing the interpolated time course
+        :return: multi-indexed series storing the interpolated time course
             of the stimulus across nodes
         '''
-        tvec, stimvecs = self.get_stim_vecs()
-        stimdata = pd.DataFrame(index=teval)
-        for node, xstim in zip(self.nodelist, stimvecs):
-            stimdata[node] = self.interpolate_stim_vec(tvec, xstim, teval)
-        return stimdata.T.stack().rename(self.STIM_KEY)
+        return self.interpolate_vectors(
+            *self.get_stim_vecs(), 
+            teval
+        ).rename(self.STIM_KEY)
+    
+    def interpolate_noise_data(self, teval):
+        '''
+        Interpolate noise current waveform along simulation time vector
+
+        :param teval: evaluation time vector (ms)
+        :return: multi-indexed series storing the interpolated time course
+            of the noise current across nodes
+        '''
+        return self.interpolate_vectors(
+            np.array(self.noise_tvec.to_python()), 
+            self.to_current_density(np.array([x.to_python() for x in self.noise_ivecs])),  # mA/cm2
+            teval
+        ).rename('iNoise')
     
     def remove_stim(self):
         ''' Remove stimulus from all nodes. '''
         if not self.is_stim_set():
-            self.log('no stimulus to remove')
+            self.log('no stimulus to remove', warn=True)
+            return
         self.log('removing stimulus')
         for inode in range(self.size):
             self.h_yvecs[inode].play_remove()
@@ -1095,6 +1160,93 @@ class NeuralNetwork:
         
         # Return concatenated data
         return data
+    
+    @property
+    def noise_amp(self):
+        ''' Get noise current amplitude (mA/cm2) '''
+        return self._noise_amp
+    
+    @noise_amp.setter
+    def noise_amp(self, val):
+        '''
+        Set noise current amplitude
+
+        :param A: noise current amplitude (mA/cm2)
+        '''
+        if val < 0:
+            raise ValueError('noise amplitude must be positive or null')
+        self._noise_amp = val  # mA/cm2
+    
+    def get_noise_vector(self, tvec):
+        '''
+        Generate Gaussian noise current vector.
+
+        :param tvec: time vector (ms)
+        :return: noise current vector (mA/cm2)
+        '''
+        return np.random.normal(0., self.noise_amp, len(tvec))
+    
+    def inject_noise_to_node(self, inode, tvec):
+        '''
+        Inject noise current to a specific node.
+
+        :param inode: node index
+        :param tvec: time vector (ms)
+        :return: noise current vector and current current clamp object
+        '''
+        # Generate Gaussian noise vector, converted to nA units 
+        noise_vec = h.Vector(self.to_current(self.get_noise_vector(tvec)))
+
+        # Create current clamp object 
+        stim = h.IClamp(self.nodes[inode](0.5))
+        stim.delay = 0.0
+        stim.dur = 1e9
+        
+        # Play noise current into current clamp
+        noise_vec.play(stim._ref_amp, tvec, True)
+
+        # Return noise current vector and current clamp object
+        return noise_vec, stim
+ 
+    def inject_noise(self, dt):
+        '''
+        Inject noise current all nodes.
+
+        :param dt: simulation time step (ms)
+        '''
+        # Generate noise time vector
+        self.noise_tvec = h.Vector(np.arange(0, self.tstop + dt / 2, dt))
+
+        # Initialize noise current vectors and current clamp objects
+        self.noise_ivecs = []
+        self.noise_iclamps = []
+
+        # Loop through model nodes
+        for inode in range(self.size):
+            # Inject noise current to node
+            noise_vec, stim = self.inject_noise_to_node(inode, self.noise_tvec)
+
+            # Append noise current vector and current clamp object to network class atributes
+            self.noise_ivecs.append(noise_vec)
+            self.noise_iclamps.append(stim)
+    
+    def has_noise(self):
+        ''' Return whether noise current is set. '''
+        return hasattr(self, 'noise_tvec')
+    
+    def remove_noise(self):
+        '''
+        Remove noise current from all nodes.
+        '''
+        if not self.has_noise():
+            self.log('no noise current to remove')
+            return
+        for inode in range(self.size):
+            self.noise_ivecs[inode].play_remove()
+            self.noise_iclamps[inode].amp = 0.
+        del self.noise_iclamps
+        del self.noise_ivecs
+        del self.noise_tvec
         
     def simulate(self, tstop=None, nreps=1, dt=None):
         '''
@@ -1113,6 +1265,10 @@ class NeuralNetwork:
                 self.log(f'repetition {irep + 1}/{nreps}')
                 data.append(self.simulate(tstop=tstop, dt=dt))
             return self.concatenate_outputs(ireps, data, self.REP_KEY)
+        
+        # If time step provided, update class attribute
+        if dt is not None:
+            self.dt = dt
         
         # If simulation duration provided, update class attribute
         if tstop is not None:
@@ -1136,9 +1292,19 @@ class NeuralNetwork:
         # Initialize recording probes
         self.record_continous_variables()
 
+        # If noise amplitude > 0
+        if self.noise_amp > 0:
+            # If dt is not provided, raise warning and set dt to default value
+            if self.dt is None:
+                logger.warning(
+                    f'Noise current injection requires fixed time step -> setting dt = {self.DEFAULT_DT} ms')
+            self.dt = self.DEFAULT_DT
+            # Inject noise current to all nodes
+            self.inject_noise(self.dt)
+
         # Set simulation time step (if provided), or set up variable time step integration
-        if dt is not None:
-            h.dt = dt  # ms
+        if self.dt is not None:
+            h.dt = self.dt  # ms
             cvode.active(0)
         else:
             cvode.active(1)
@@ -1157,6 +1323,13 @@ class NeuralNetwork:
         # If stimulus is set, interpolate stimulus waveforms along simulation time vector
         if self.is_stim_set():
             data[self.STIM_KEY] = self.interpolate_stim_data(self.extract_time(data))
+
+        # If noise is set
+        if self.has_noise():
+            # Interpolate noise current waveforms along simulation time vector
+            data['iNoise'] = self.interpolate_noise_data(self.extract_time(data))
+            # Remove noise current from all nodes
+            self.remove_noise()
 
         # If drive is set, extract dictionary of presynaptic drive events, and add it to data
         if self.is_drive_set():
@@ -1588,7 +1761,7 @@ class NeuralNetwork:
             else:
                 ylabel = 'g (uS/cm2)'
             axrow[0].set_ylabel(ylabel)
-            for condkey in self.record_dict['conductances']:
+            for condkey, color in zip(self.record_dict['conductances'], plt.get_cmap('Dark2').colors):
                 if condkey in timeseries:
                     for ax, (_, g) in zip(axrow, timeseries[condkey].groupby(self.NODE_KEY)):
                         g = g.droplevel(self.NODE_KEY)
@@ -1604,7 +1777,7 @@ class NeuralNetwork:
                                 g = g / g.iloc[0] * 100
                         elif gmode == 'norm':
                             g = g / g.max() * 100
-                        g.plot(ax=ax, label=f'${label}$')
+                        g.plot(ax=ax, label=f'${label}$', color=color)
             axrow[-1].legend(**leg_kwargs)
             if gmode == 'log':
                 for ax in axrow:
@@ -1618,14 +1791,20 @@ class NeuralNetwork:
             axrow = axes[irow]
             clabel = 'I (mA/cm2)' if curr_polarity == 'original' else '|I| (mA/cm2)'
             axrow[0].set_ylabel(clabel)
-            for ckey, color in zip(self.record_dict['currents'], plt.get_cmap('Dark2').colors):
+            zorders = dict(zip(
+                self.record_dict['currents'].keys(),
+                np.arange(len(self.record_dict['currents'].keys()))[::-1]
+            ))
+            for ckey, color in zip(self.record_dict['currents'], plt.get_cmap('tab10').colors):
                 if ckey in timeseries:
                     sign = 1
                     if curr_polarity == 'rectified' and ckey in self.RECTIFIED_CURRENTS:
                         sign = -1
+                    alpha = 0.5 if ckey == 'iNoise' else 1. 
                     for iax, (ax, (_, current)) in enumerate(zip(axrow, timeseries[ckey].groupby(self.NODE_KEY))):
                         s = sign * current.droplevel(self.NODE_KEY)
-                        s.plot(ax=ax, label=f'$i_{{{ckey[1:]}}}$', color=color)
+                        s.plot(
+                            ax=ax, label=f'$i_{{{ckey[1:]}}}$', color=color, alpha=alpha, zorder=zorders[ckey])
                         if ckey not in self.CLIPPED_CURRENTS:
                             bounds_per_ax[iax, 0] = min(bounds_per_ax[iax, 0], s.min())
                             bounds_per_ax[iax, 1] = max(bounds_per_ax[iax, 1], s.max())
@@ -2295,7 +2474,7 @@ class NeuralNetwork:
         # Concatenate metric results and return
         return self.concatenate_outputs(kinds, mdata, 'stim dist.')
 
-    def explore2D(self, wrange, arange, Isppa_range, title=None, **kwargs):
+    def explore2D(self, wrange, arange, Isppa_range, title=None, metric='nspikes', **kwargs):
         '''
         Explore 2D parameter space of synaptic weight and stimulus sensitivity.
         
@@ -2305,8 +2484,8 @@ class NeuralNetwork:
         :param title: figures title
         :return: figure handles
         '''
-        # Initialize metric container
-        metric = []
+        # Initialize metric data container
+        mdata = []
 
         # Create figure to plot E/I imbalance profiles
         EIfig, EIaxes = plt.subplots(1, len(arange), figsize=(2.5 * len(arange), 1.5), sharex=True, sharey=True)
@@ -2327,20 +2506,20 @@ class NeuralNetwork:
 
                 # Run comparative Isppa sweep for each stimulus distribution, compute metric
                 # and append to container
-                metric.append(
-                    self.run_comparative_sweep(Isppa_range, 'nspikes', **kwargs))
+                mdata.append(
+                    self.run_comparative_sweep(Isppa_range, metric, **kwargs))
 
         # Concatenate results
-        metric = self.concatenate_outputs(
+        mdata = self.concatenate_outputs(
             list(itertools.product(arange, wrange * 1e6)), 
-            metric, 
+            mdata, 
             ['a', 'w (uS/cm2)']
         )
 
         # Plot Isppa dependencies
         logger.info('plotting Isppa dependencies...')
         fg = sns.FacetGrid(
-            metric.reset_index(),
+            mdata.reset_index(),
             row='w (uS/cm2)',
             col='a',
             aspect=1.3,
@@ -2352,7 +2531,7 @@ class NeuralNetwork:
         for iw, w in enumerate(wrange):
             for ix, a in enumerate(arange):
                 self.plot_sweep_results(
-                    metric.loc[a, w * 1e6],
+                    mdata.loc[a, w * 1e6],
                     ax=fg.axes[iw, ix], 
                     legend=iw == wrange.size // 2 and ix == arange.size - 1,
                     xscale='sqrt',
@@ -2382,10 +2561,16 @@ class NeuralNetwork:
             just supra-threshold value ("supra"), or a mid-point between the two ("mid")
         :return: threshold Isppa value
         '''
+        # If "mid" side requested, recursively call function for both "sub" and "supra" sides
         if side == 'mid':
             tsub = self.find_threshold(s, value=value, agg=agg, side='sub')
             tsupra = self.find_threshold(s, value=value, agg=agg, side='supra')
             return (tsub + tsupra) / 2
+        
+        # If input has multiple reps, aggregate across reps
+        if self.REP_KEY in s.index.names:
+            s = s.groupby(level=[k for k in s.index.names if k != self.REP_KEY]).mean()
+
         # Compute cross-node aggregate metric
         sagg = s.unstack(level='node').agg(agg, axis=1)
 
