@@ -2,21 +2,32 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-12-12 21:29:54
+# @Last Modified time: 2023-12-20 15:25:10
 
-import itertools
-from tqdm import tqdm
+# External imports
+import sys
 import os
-from neuron import h
-import pandas as pd
-from scipy.interpolate import interp1d
+import itertools
+import warnings
+from tqdm import tqdm
 import numpy as np
+from scipy.interpolate import interp1d
+import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
-import warnings
+from neuron import h
 
+# Internal modules imports
 from logger import logger
 from utils import *
+
+
+# Matplotlib parameters
+import matplotlib
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
+if sys.platform != 'linux':
+    matplotlib.rcParams['font.family'] = 'arial'
 
 
 # Initalize handler for multi-order variable time step integration method
@@ -95,9 +106,12 @@ class NeuralNetwork:
 
     # Default model parameters
     Acell = 11.84e3  # Cell membrane area (um2)
+    GKT = 0.58e-9  # S/°C
+    gKT_default = GKT / (Acell * UM_TO_CM**2)  # S/cm2
     G_RS_RS = 0.002  # Synaptic weight between RS cells, from Plaksin 2016 (uS)
     g_RS_RS = (G_RS_RS / S_TO_US) / (Acell * UM_TO_CM**2)  # Synaptic weight between RS cells (S/cm2)
     
+    Cm = 1.0  # membrane capacitance (uF/cm2)
     mechname = 'RS'  # NEURON mechanism name
     vrest = -71.9  # neurons resting potential (mV)
     DEFAULT_DT = 0.025  # default integration time step (ms)
@@ -127,8 +141,8 @@ class NeuralNetwork:
         'currents': {
             'iStim': 'stimulus-driven current (mA/cm2)',
             'iKT': 'thermally-driven Potassium current (uA/cm2)',
-            'iM': 'slow non-inactivating potassium current (mA/cm2)',
             'iSyn': 'synaptic current (mA/cm2)',
+            'iM': 'slow non-inactivating potassium current (mA/cm2)',
             'iDrive': 'driving current (mA/cm2)',
             'iNa': 'sodium current (mA/cm2)',
             'iKd': 'potassium current (mA/cm2)',
@@ -138,8 +152,24 @@ class NeuralNetwork:
         },
     }
 
-    RECTIFIED_CURRENTS = ['iDrive', 'iNa', 'iStim']  # currents that should be rectified
-    CLIPPED_CURRENTS = ['iNa', 'iKd', 'iLeak', 'iDrive', 'iSyn', 'iM', 'iNoise']  # currents that should be clipped upon plotting
+    RECTIFIED_CURRENTS = [  # currents that should be rectified
+        'iDrive', 
+        'iNa', 
+        'iStim'
+    ]  
+    CLIPPED_CURRENTS = [   # currents that should be clipped upon plotting
+        'iNa', 
+        'iKd', 
+        'iLeak', 
+        'iDrive', 
+        'iSyn', 
+        'iM', 
+        'iNoise'
+    ]                
+    ABSOLUTE_CURRENTS = [  # currents that should be converted to current density
+        'iDrive', 
+        'iSyn'
+    ]
 
     TIMEVAR_SUFFIX = '_t'  # suffix to add to time-varying conductance variables
 
@@ -214,7 +244,7 @@ class NeuralNetwork:
         :return: filtered record dictionary
         '''
         # Get serialized list of all recordable variables
-        allkeys = cls.record_keys(list(cls.record_dict.keys()))
+        allkeys = cls.record_keys(list(cls.record_dict.keys())) + ['iNet']
 
         # List variables that should be excluded
         toremove = []
@@ -234,13 +264,14 @@ class NeuralNetwork:
         allkeys = [k for k in allkeys if k not in toremove]
         return allkeys
 
-    def __init__(self, nnodes, connect=True, synweight=None, noise_amp=0., verbose=True, **kwargs):
+    def __init__(self, nnodes, connect=True, synweight=None, conrate=1., noise_amp=0., verbose=True, **kwargs):
         '''
         Initialize a neural network with a given number of nodes.
         
         :param nnodes: number of nodes
         :param connect: whether to connect nodes (default: True)
-        :param synweight: synaptic weight (uS) (default: None)
+        :param synweight: synaptic weight (mS/cm2) (default: None)
+        :param conrate: connection rate (default: 1)
         :param noise_amp: noise amplitude (default: 0)
         :param verbose: verbosity flag (default: True)
         :param kwargs: model parameters passed as "key=value" pairs (optional)
@@ -259,7 +290,7 @@ class NeuralNetwork:
         
         # Connect nodes with appropriate synaptic weights, if requested
         if connect and nnodes > 1:
-            conkwargs = {}
+            conkwargs = {'fraction': conrate}
             if synweight is not None:
                 conkwargs['weight'] = synweight
             self.connect_nodes(**conkwargs)
@@ -290,19 +321,26 @@ class NeuralNetwork:
         # If number of nodes not provided, use same as original network
         if nnodes is None:
             nnodes = self.size
+
+        # Initialize dictionary of parameters to pass to new instance
+        initkwargs = {
+            'verbose': self.verbose,
+            'connect': False,
+        }
+
+        # If connected, assign same synaptic weight and connection rate as original network
+        if self.is_connected():
+            initkwargs['synweight'] = self.get_synaptic_weight()
+            initkwargs['conrate'] = self.get_connection_rate()
+            initkwargs['connect'] = True
         
         # Create new instance of the class
         model = self.__class__(
             nnodes, 
-            connect=self.is_connected(),
-            verbose=self.verbose,
+            **initkwargs,
             **self.mech_params
         )
 
-        # If connected, assign same synaptic weight parameter as original network
-        if self.is_connected():
-            model.set_synaptic_weight(self.get_synaptic_weight())
-        
         # If drive is set, assign same pre-synaptic drive parameters as original network
         if self.is_drive_set():
             model.set_presyn_drive(**self.get_drive_params())
@@ -378,6 +416,11 @@ class NeuralNetwork:
         return len(self.nodes)
 
     @property
+    def inodes(self):
+        ''' Return array of node indexes. '''
+        return np.arange(self.size)
+
+    @property
     def nodelist(self):
         ''' Return list of node names. '''
         return [node.name() for node in self.nodes]
@@ -388,8 +431,9 @@ class NeuralNetwork:
         return self.nodes[0](0.5).area()  # um2
     
     def set_biophysics(self):
-        ''' Assign membrane mechanisms to all nodes. '''
+        ''' Assign membrane capcitance and membrane mechanisms to all nodes. '''
         for node in self.nodes:
+            node.cm = self.Cm
             node.insert(self.mechname)
     
     def get_mech_param(self, key, inode=0):
@@ -417,6 +461,20 @@ class NeuralNetwork:
         except ValueError:
             raise AttributeError(f'"{self}" does not have "{name}" attribute')
     
+    def parse_node_index(self, inode):
+        '''
+        Parse a node index.
+
+        :param inode: node index (int, list, tuple or None)
+        :return: parsed list of node indexes
+        '''
+        # If no node index provided, return array of all node indexes
+        if inode is None:
+            return self.inodes
+        # Otherwise, return provided node index(es) as array
+        else:
+            return np.asarray(as_iterable(inode))
+    
     def _set_mech_param(self, key, value, inode=None):
         '''
         Set a specific mechanism parameter on a specific set of nodes.
@@ -435,11 +493,8 @@ class NeuralNetwork:
         if value == default_val:
             return
 
-        # Identify target nodes
-        if inode is None:
-            inode = list(range(self.size))
-        elif isinstance(inode, int):
-            inode = [inode]
+        # Parse node index
+        inode = self.parse_node_index(inode)
         
         # Set new parameter value on nodes
         if len(inode) == 1:
@@ -465,41 +520,59 @@ class NeuralNetwork:
     
     def to_absolute_conductance(self, g):
         '''
-        Convert synaptic weight from relative to absolute conductance.
+        Convert conductance density to absolute conductance.
 
-        :param g: synaptic weight (S/cm2)
-        :return: synaptic weight (uS)
+        :param g: conductance density, expressed in NEURON units (S/cm2)
+        :return: absolute conductance, expressed in NEURON units (uS)
         '''
-        # Multiply by neuron soma membrane area, and convert to uS
-        return (g * self.S_TO_US) * (self.Acell * self.UM_TO_CM**2) 
+        # Get cell membrane area in cm2
+        A = self.Acell * self.UM_TO_CM**2  # cm2
+        # Multiply by neuron soma membrane area
+        G = g * A  # S
+        # Convert to uS, and return
+        return G * self.S_TO_US  # uS
     
-    def to_relative_conductance(self, G):
+    def to_conductance_density(self, G):
         '''
-        Convert synaptic weight from absolute to relative conductance
+        Convert absolute conductance to conductance density.
 
-        :param G: synaptic weight (uS)
-        :return: synaptic weight (S/cm2)
+        :param G: absolute conductance, expressed in NEURON units (uS)
+        :return: conductance density, expressed in NEURON units (S/cm2)
         '''
-        # Divide by neuron soma membrane area, and convert to S/cm2
-        return (G / self.S_TO_US) / (self.Acell * self.UM_TO_CM**2)
+        # Convert conductance to S
+        G = G / self.S_TO_US  # S
+        # Get cell membrane area in cm2
+        A = self.Acell * self.UM_TO_CM**2  # cm2
+        # Divide by neuron soma membrane area, and return
+        return G / A  # S/cm2
 
     def to_current_density(self, I):
         '''
-        Convert current to current density for compatibility with NEURON formalism.
+        Convert current to current density.
 
-        :param I: absolute current (nA)
-        :return: current density (mA/cm2)
+        :param I: absolute current, expressed in NEURON units (nA)
+        :return: current density, expressed in NEURON units (mA/cm2)
         '''
-        return I * self.NA_TO_MA / (self.Acell * self.UM_TO_CM**2)
+        # Convert current to mA
+        I = I * self.NA_TO_MA  # mA
+        # Get cell membrane area in cm2
+        A = self.Acell * self.UM_TO_CM**2  # cm2
+        # Divide by neuron soma membrane area, and return
+        return I / A  # mA/cm2
     
     def to_current(self, i):
         '''
         Convert current density to current for compatibility with NEURON formalism.
 
-        :param i: current density (mA/cm2)
-        :return: absolute current (nA)
+        :param i: current density, expressed in NEURON units (mA/cm2)
+        :return: absolute current, expressed in NEURON units (nA)
         '''
-        return i / self.NA_TO_MA * (self.Acell * self.UM_TO_CM**2)
+        # Get cell membrane area in cm2
+        A = self.Acell * self.UM_TO_CM**2  # cm2
+        # Multiply by neuron soma membrane area
+        I = i * A  # mA
+        # Convert to nA, and return
+        return I / self.NA_TO_MA  # nA
     
     def set_presyn_drive(self, inode=None, delay=0, weight=4.5e-4, sync=False, **kwargs):
         ''' 
@@ -511,11 +584,8 @@ class NeuralNetwork:
         :param sync: whether to synchronize pre-synaptic drive across nodes (default: False)
         :param kwargs: dictionary of parameter names and values fed to "get_NetStim" function
         '''
-        # Identify target nodes
-        if inode is None:
-            inode = list(range(self.size))
-        elif isinstance(inode, int):
-            inode = [inode]
+        # Parse node index(es)
+        inode = self.parse_node_index(inode)
         
         self.log(f'setting pre-synaptic drive on nodes {inode}')
 
@@ -528,7 +598,7 @@ class NeuralNetwork:
         # For each target node
         for i in inode:
             if self.is_drive_set(inode=i):
-                logger.warning(f'modifying pre-synaptic drive on node {i}')
+                self.log(f'modifying pre-synaptic drive on node {i}', warn=True)
             # Create simple synapse object and attach it to node 
             syn = h.ExpSyn(self.nodes[i](0.5))
             syn.tau = 1  # decay time constant (ms)
@@ -552,11 +622,8 @@ class NeuralNetwork:
         :param inode: node index (default: None, i.e. all nodes)
         :return: dictionary of pre-synaptic drive parameters
         '''
-        # Identify target nodes
-        if inode is None:
-            inode = list(range(self.size))
-        elif isinstance(inode, int):
-            inode = [inode]
+        # Parse node index(es)
+        inode = self.parse_node_index(inode)
 
         # Get drive parameters
         params = {}
@@ -585,11 +652,8 @@ class NeuralNetwork:
         :param as_scalar: whether to return a scalar (default: True)
         :return: boolean(s) indicating whether drive is set on specified node(s) 
         '''
-        # Identify target nodes
-        if inode is None:
-            inode = list(range(self.size))
-        elif isinstance(inode, int):
-            inode = [inode]
+        # Parse node index(es)
+        inode = self.parse_node_index(inode)
         
         # Check status of pre-synaptic drive in all nodes
         out = [self.drive_objs[i] is not None for i in inode]
@@ -618,16 +682,13 @@ class NeuralNetwork:
 
         :param inode: node index (default: None, i.e. all nodes)
         '''
-        # Identify target nodes
-        if inode is None:
-            inode = list(range(self.size))
-        elif isinstance(inode, int):
-            inode = [inode]
+        # Parse node index(es)
+        inode = self.parse_node_index(inode)
 
         # For each target node
         for i in inode:
             if not self.is_drive_set(inode=i):
-                logger.warning(f'no pre-synaptic drive to remove at node {i}')
+                self.log(f'no pre-synaptic drive to remove at node {i}', warn=True)
             else:
                 stim, _, nc = self.drive_objs[i]
                 stim.number = 0
@@ -665,15 +726,41 @@ class NeuralNetwork:
         nc.weight[0] = self.to_absolute_conductance(weight)  # synaptic weight (uS)
 
         # Append synapse and netcon objects to connections atribute 
-        self.connections[ipresyn, ipostsyn] = (syn, nc)
+        self.connections[ipresyn, ipostsyn] = (syn, nc)    
     
-    def connect_nodes(self, **kwargs):
-        ''' Form all specific connections between network nodes '''
-        self.log('connecting all node pairs')
+    def connect_nodes(self, fraction=1., **kwargs):
+        ''' 
+        Form specific connections between network nodes
+        
+        :param fraction: fraction of nodes to connect (default: 1)
+        '''
+        # Check that fraction is between 0 and 1
+        if not is_within(fraction, (0, 1)):
+            raise ValueError(f'invalid connection fraction: {fraction}')
+        
+        # List all candidate node pairs (exluding self-connections)
+        candidate_pairs = np.array(list(itertools.permutations(self.inodes, 2)))
+        ncandidates = candidate_pairs.shape[0]
+
+        # Determine number of connections to be made according to the specified fraction
+        nconns = int(np.round(fraction * ncandidates))
+
+        # Select a random subset of node pairs to connect
+        idxs = np.sort(np.random.choice(np.arange(ncandidates), nconns, replace=False))
+        pairs = candidate_pairs[idxs]
+
+        # Compute effective fraction of selected node pairs, and check that it is within 1% of the requested fraction
+        frac = nconns / ncandidates
+        if np.abs(frac - fraction) > 0.01:
+            raise ValueError(f'computed connection fraction ({fraction}) diverges from requested fraction ({frac})')
+        self.log(f'connecting {frac * 1e2:.1f}% ({nconns}/{ncandidates}) of candidate node pairs')
+
+        # Initialize connections 2D array
         self.connections = np.full((self.size, self.size), None)
-        for pair in itertools.combinations(range(self.size), 2):
+
+        # For each selected node pair
+        for pair in pairs:
             self.connect(*pair, **kwargs)
-            self.connect(*pair[::-1], **kwargs)
     
     def is_connected(self):
         ''' Return whether network nodes are connected. '''
@@ -681,11 +768,15 @@ class NeuralNetwork:
     
     def disconnect_nodes(self):
         ''' Clear all synapses and network connection objects between nodes '''
-        logger.info('removing all connections between nodes')
+        self.log('removing all connections between nodes')
         self.connections = None
     
     def set_synaptic_weight(self, w):
-        ''' Set synaptic weight on all connections. '''
+        ''' 
+        Set synaptic weight on all connections.
+        
+        :param w: synaptic weight (S/cm2)
+        '''
         if not self.is_connected():
             raise ValueError('Network nodes are not connected')
         self.log(f'setting all synaptic weights to {w:.2e} S/cm2')
@@ -694,13 +785,38 @@ class NeuralNetwork:
                 con[1].weight[0] = self.to_absolute_conductance(w)  # synaptic weight (uS)
     
     def get_synaptic_weight(self):
-        ''' Return synaptic weight on all connections. '''
+        '''
+        Return synaptic weight on all connections.
+        
+        :return: synaptic weight (S/cm2)
+        '''
         if not self.is_connected():
             raise ValueError('Network nodes are not connected')
         for con in np.ravel(self.connections):
             if con is not None:
-                return self.to_relative_conductance(con[1].weight[0])
+                return self.to_conductance_density(con[1].weight[0])
         raise ValueError('No synaptic weight found')
+    
+    def set_connection_rate(self, fraction):
+        ''' 
+        Set connection rate between nodes.
+        
+        :param fraction: fraction of nodes to connect (0-1)
+        '''
+        if not self.is_connected():
+            raise ValueError('Network nodes are not connected')
+        self.disconnect_nodes()
+        self.connect_nodes(fraction=fraction)
+
+    def get_connection_rate(self):
+        '''
+        Return connection rate between nodes.
+        
+        :return: connection rate (0-1)
+        '''
+        if not self.is_connected():
+            raise ValueError('Network nodes are not connected')
+        return np.count_nonzero(self.connections) / self.connections.size
     
     @staticmethod
     def get_probe(var):
@@ -756,14 +872,14 @@ class NeuralNetwork:
 
         # If variable is synaptic current
         if varname == 'iSyn':
-            logger.debug(f'recording all synaptic currents')
+            logger.debug(f'recording post-synaptic currents')
             # Initialize recording probes list for synaptic currents
             self.probes[varkey] = []
             # For each post-synaptic node
-            for ipostnode in range(self.size):
+            for ipostnode in self.inodes:
                 plist = []
                 # For each pre-synaptic node
-                for iprenode in range(self.size):
+                for iprenode in self.inodes:
                     # If connection exists
                     if self.connections[iprenode, ipostnode] is not None:
                         # record synaptic current
@@ -780,7 +896,7 @@ class NeuralNetwork:
             # Record variable on all nodes
             logger.debug(f'recording "{varname}" on all nodes with key "{varkey}"')
             self.probes[varkey] = [
-                self.get_probe(self.get_var_ref(inode, varname)) for inode in range(self.size)]
+                self.get_probe(self.get_var_ref(inode, varname)) for inode in self.inodes]
     
     def get_disabled_currents(self):
         ''' 
@@ -796,9 +912,7 @@ class NeuralNetwork:
                     gkey,   # conductance key
                     f'i{gkey[1:]}'.rstrip('bar')   # current key
                 ))
-        self.verbose = False
-        self.log(f'disabled currents: {", ".join([ikey for _, ikey in l])}')
-        self.verbose = True
+        logger.debug(f'disabled currents: {", ".join([ikey for _, ikey in l])}')
         is_drive_set = self.is_drive_set()
         if isinstance(is_drive_set, list):
             is_drive_set = all(is_drive_set)
@@ -880,17 +994,20 @@ class NeuralNetwork:
 
         for k, v in self.probes.items():
             if k == 'iSyn':
-                # Extract 2D array of sum of synaptic current time course across nodes
+                # Initialize 2D array of synaptic current time course across nodes
                 vpernode = np.zeros((self.size, len(t)))
+                # For each post-synaptic node
                 for ipost, probes in enumerate(v):
+                    # Extract 2D array of synaptic current time course across pre-synaptic nodes
                     vpres = np.array([x.to_python() for x in probes])
+                    # Sum across pre-synaptic nodes to obtain total synaptic current flowing into post-synaptic node
                     vpernode[ipost] = np.sum(vpres, axis=0)
             else:
                 # Extract 2D array of variable time course across nodes
                 vpernode = np.array([x.to_python() for x in v])
 
             # If probe recorded absolute current, convert to current density
-            if k == 'iDrive':
+            if k in self.ABSOLUTE_CURRENTS:
                 vpernode = self.to_current_density(vpernode)
             
             # Create multi-indexed series from 2D array, and append to output dataframe
@@ -1005,8 +1122,15 @@ class NeuralNetwork:
                 s = f'{s} {suffix}'
             return s
 
-    def set_stim(self, amps, start=None, dur=None):
-        ''' Set stimulus per node node with specific waveform parameters. '''
+    def set_stim(self, A, start=None, dur=None, fraction=1.):
+        ''' 
+        Set stimulus per node node with specific waveform parameters.
+        
+        :param A: stimulus amplitude scalar, or vector of amplitudes per node
+        :param start: stimulus start time (ms)
+        :param dur: stimulus duration (ms)
+        :param fraction: fraction of nodes to stimulate (default: 1)
+        '''
         # If stimulus start/duration provided, update class attribute
         if start is not None:
             self.start = start
@@ -1023,9 +1147,13 @@ class NeuralNetwork:
         elif self.dur <= 0:
             raise ValueError('Stimulus duration must be strictly positive')
 
-        # If scalar amplitude provided, expand to all nodes
-        if isinstance(amps, (int, float)):
-            amps = [amps] * self.size
+        # If scalar amplitude provided, convert fo amplitudes vector using specified fraction
+        if isinstance(A, (int, float)):
+            amps = self.get_stimdist_vector(kind=fraction) * A
+
+        # Otherwise, set amplitudes vector
+        else:
+            amps = np.asarray(A)
 
         # Check that stimulus amplitudes are valid
         if len(amps) != self.size:
@@ -1033,8 +1161,12 @@ class NeuralNetwork:
         if any(amp < 0 for amp in amps):
             raise ValueError('Stimulus amplitude must be positive')
         
-        amps_str = self.vecstr(amps, suffix='W/cm2')
-        self.log(f'setting {self.dur:.2f} ms stimulus with node-specific amplitudes:\n{amps_str}')
+        # Compute fraction of nodes that will be stimulated
+        frac = np.mean(amps > 0)
+        A = amps.max()
+        self.log(f'setting {self.dur:.2f} ms stimulus with amplitude {A:.2f} W/cm2 on {frac * 1e2:.1f}% of nodes')
+        # amps_str = self.vecstr(amps, suffix='W/cm2')
+        # self.log(f'setting {self.dur:.2f} ms stimulus with node-specific amplitudes:\n{amps_str}')
         
         # Set stimulus vectors
         self.h_yvecs = []
@@ -1044,7 +1176,7 @@ class NeuralNetwork:
         self.h_tvec = h.Vector(tvec)
 
         # Play stimulus on all nodes with node-specific amplitudes
-        for inode in range(self.size):
+        for inode in self.inodes:
             self.h_yvecs[inode].play(
                 self.get_var_ref(inode, 'I'), self.h_tvec, True)
     
@@ -1124,7 +1256,7 @@ class NeuralNetwork:
             self.log('no stimulus to remove', warn=True)
             return
         self.log('removing stimulus')
-        for inode in range(self.size):
+        for inode in self.inodes:
             self.h_yvecs[inode].play_remove()
         del self.h_tvec
         del self.h_yvecs
@@ -1224,7 +1356,7 @@ class NeuralNetwork:
         self.noise_iclamps = []
 
         # Loop through model nodes
-        for inode in range(self.size):
+        for inode in self.inodes:
             # Inject noise current to node
             noise_vec, stim = self.inject_noise_to_node(inode, self.noise_tvec)
 
@@ -1243,7 +1375,7 @@ class NeuralNetwork:
         if not self.has_noise():
             self.log('no noise current to remove')
             return
-        for inode in range(self.size):
+        for inode in self.inodes:
             self.noise_ivecs[inode].play_remove()
             self.noise_iclamps[inode].amp = 0.
         del self.noise_iclamps
@@ -1298,11 +1430,15 @@ class NeuralNetwork:
         if self.noise_amp > 0:
             # If dt is not provided, raise warning and set dt to default value
             if self.dt is None:
-                logger.warning(
-                    f'Noise current injection requires fixed time step -> setting dt = {self.DEFAULT_DT} ms')
+                self.log(
+                    f'noise current injection requires fixed time step -> setting dt = {self.DEFAULT_DT} ms', warn=True)
             self.dt = self.DEFAULT_DT
             # Inject noise current to all nodes
             self.inject_noise(self.dt)
+        else:
+            if dt is None and self.dt is not None:
+                self.log('no noise current injection -> switching to variable dt', warn=True)
+                self.dt = None
 
         # Set simulation time step (if provided), or set up variable time step integration
         if self.dt is not None:
@@ -1332,6 +1468,10 @@ class NeuralNetwork:
             data['iNoise'] = self.interpolate_noise_data(self.extract_time(data))
             # Remove noise current from all nodes
             self.remove_noise()
+
+        # Compute and add net current (without contribution of noise current)
+        ckeys = [k for k in self.record_dict['currents'] if k in data and k!= 'iNoise']
+        data['iNet'] = data[ckeys].sum(axis=1).rename('iNet')
 
         # If drive is set, extract dictionary of presynaptic drive events, and add it to data
         if self.is_drive_set():
@@ -1543,14 +1683,89 @@ class NeuralNetwork:
         
         # Return list of stimulus response per node
         return stimresps
+    
+    @staticmethod
+    def nspikes_to_peak_dFF(n):
+        ''' Convert number of spikes to peak dFF. '''
+        return sigmoid(n, 15, 3)
+    
+    @classmethod
+    def plot_peak_dFF_vs_nspikes(cls, nmax=50, ax=None):
+        ''' 
+        Plot peak dFF vs number of spikes.
+        
+        :param nmax: maximal number of spikes (optional)
+        :param ax: axis to plot on (optional)
+        :return: figure handle
+        '''
+        # Define number of spikes vector
+        nspikes = np.linspace(0, nmax, 100)
 
-    def compute_metric(self, data, metric):
+        # Convert to peak dFF vector
+        dFF = cls.nspikes_to_peak_dFF(nspikes)
+
+        # Construct/retrieve figure and axis
+        if ax is None:
+            fig, ax = plt.subplots(figsize=(4, 3))
+        else:
+            fig = ax.get_figure()
+        sns.despine(ax=ax)
+                
+        # Plot peak dFF vs number of spikes
+        ax.plot(nspikes, dFF, 'k')
+        ax.set_xlabel('number of spikes')
+        ax.set_ylabel('peak dFF')
+        
+        # Return figure
+        return fig
+    
+    def select_nodes(self, timeseries, inodes='all'):
+        '''
+        Select nodes from simulation output dataframe.
+
+        :param timeseries: multi-indexed simulation output dataframe
+        :param inodes: list of nodes to select (default: 'all'). One of:
+            - 'all' (for all nodes)
+            - 'stim' (for sonictaed nodes only)
+            - 'nostim' (for non-sonicated nodes only)
+            - list of node indexes
+        :return: selected nodes list
+        '''
+        # If inodes is a string, generate corresponding list of node indexes
+        if isinstance(inodes, str):
+            # If all nodes requested, return to all nodes
+            if inodes == 'all':
+                return self.nodelist
+            # Otherwise, compute max stimulus amplitude per node
+            else:
+                Amax = timeseries[self.STIM_KEY].groupby(self.NODE_KEY).max()
+                # If only stimulated nodes requested, extract nodes with non-null max amplitude
+                if inodes == 'stim':
+                    return Amax[Amax > 0].index.values
+                # If only non-stimulated nodes requested, extract nodes with null max amplitude
+                elif inodes == 'nostim':
+                    return Amax[Amax == 0].index.values
+        # If inodes is an integer or a list of integers, convert to list of node names
+        else:
+            inodes = as_iterable(inodes)
+            if isinstance(inodes[0], int):
+                return [self.nodelist[i] for i in inodes]
+
+        # Otherwise, return inodes as-is
+        return inodes
+
+    def compute_metric(self, data, metric, inodes='all'):
         '''
         Compute metric across nodes from simulation output.
         
         :param data: multi-indexed simulation output dataframe, 
             and potential presynaptic drive events
         :param metric: metric name
+        :param inodes: list of nodes to compute metric for (default: 'all'). One of:
+            - 'all' (for all nodes)
+            - 'stim' (for sonictaed nodes only)
+            - 'nostim' (for non-sonicated nodes only)
+            - list of node indexes
         :return: array(s) of metric value per node
         '''
         # Unpack data
@@ -1570,8 +1785,20 @@ class NeuralNetwork:
                 gdata = gdata.droplevel(gby)
                 if events is not None:
                     gdata = (gdata, events.loc[gkey])
-                mdict[gkey] = self.compute_metric(gdata, metric)
+                mdict[gkey] = self.compute_metric(gdata, metric, inodes=inodes)
             return self.concatenate_outputs(mdict.keys(), list(mdict.values()), gby)
+        
+        # If inodes is a string, generate corresponding list of node indexes
+        inodes = self.select_nodes(timeseries, inodes=inodes)
+
+        # Filter timeseries and events according to requested nodes
+        mux_slice = [slice(None)] * timeseries.index.nlevels
+        mux_slice[timeseries.index.names.index(self.NODE_KEY)] = inodes
+        timeseries = timeseries.loc[tuple(mux_slice)]
+        if events is not None:
+            mux_slice = [slice(None)] * events.index.nlevels
+            mux_slice[events.index.names.index(self.NODE_KEY)] = inodes
+            events = events.loc[tuple(mux_slice)]
 
         # Extract time vector from timeseries
         t = self.extract_time(timeseries) # ms
@@ -1609,7 +1836,7 @@ class NeuralNetwork:
             m = pd.Series(m, name=metric)
         
         # Set index
-        m.index = self.nodelist
+        m.index = inodes
         m.index.name = self.NODE_KEY
 
         # Return
@@ -1638,7 +1865,7 @@ class NeuralNetwork:
         return timeseries[keys]
 
     def plot_results(self, data, tref='onset', gmode='abs', addstimspan=True, title=None, 
-                     curr_polarity='original', clip_currents=False, **kwargs):
+                     rectify_currents=False, clip_currents=False, add_net_current=False, **kwargs):
         '''
         Plot the time course of variables recorded during simulation.
         
@@ -1651,11 +1878,12 @@ class NeuralNetwork:
             - "log" (for logarithmic) 
         :param addstimspan: whether to add a stimulus span on all axes (default: True)
         :param title: optional figure title (default: None)
-        :param curr_polarity: current polarity used for current plot:
-            - "original": plot each current with its original polarity
-            - "rectified": plot each current with the same polarity
+        :param rectify_currents: whether to rectify currents so that they all have 
+            the same polarity on the plot (default: False)
         :param clip_currents: whether to clip currents with large transient amplitudes to better
             appreciate the dynamics of other currents (default: False)
+        :param add_net_current: whether to add a line of the net membrane current 
+            on the currents graph (default: False)
         :return: figure handle 
         '''
         # Check that plotting mode is valid
@@ -1684,12 +1912,18 @@ class NeuralNetwork:
 
         # Create figure with appropriate number of rows and columns
         hrow = 1.5
-        wcol = 3.5
+        wcol = 3
         nrows = int(hasstim) + int(hastemps) + int(hasconds) + int(hascurrs) + int(hasvoltages)
         nnodes_out = len(timeseries.index.unique(self.NODE_KEY))
         assert nnodes_out == self.size, f'number of nodes ({self.size}) does not match number of output voltage traces ({nnodes_out})'
         ncols = self.size
-        fig, axes = plt.subplots(nrows, ncols, figsize=(wcol * ncols + 1.5, hrow * nrows), sharex=True, sharey='row')
+        fig, axes = plt.subplots(
+            nrows, 
+            ncols, 
+            figsize=(wcol * ncols + 1.5, hrow * nrows), 
+            sharex=True, 
+            sharey='row'
+        )
         if ncols == 1:
             axes = np.atleast_2d(axes).T
         sns.despine(fig=fig)
@@ -1710,7 +1944,7 @@ class NeuralNetwork:
             # Extract max stimulus intensity per node, and complete column titles
             Isppas = timeseries[self.STIM_KEY].groupby(self.NODE_KEY).max()
             for ax, Isppa in zip(axes[0], Isppas):
-                ax.set_title(f'{ax.get_title()} - Isppa = {Isppa:.1f} W/cm2')
+                ax.set_title(f'{ax.get_title()}: {Isppa:.0f} W/cm2')
             
             # Extract stimulus bounds            
             tvec, _ = self.get_stim_vecs()
@@ -1773,7 +2007,7 @@ class NeuralNetwork:
                             label = f'g_{{{condkey[1:]}}}'
                         if gmode == 'rel':
                             if g.iloc[0] == 0:
-                                logger.warning(f'Cannot compute relative conductance for {label}: baseline is 0')
+                                self.log(f'Cannot compute relative conductance for {label}: baseline is 0', warn=True)
                             with warnings.catch_warnings():
                                 warnings.simplefilter('ignore')
                                 g = g / g.iloc[0] * 100
@@ -1791,26 +2025,40 @@ class NeuralNetwork:
             bounds_per_ax = np.zeros((len(axes[irow]), 2))
             ncurrs = 0
             axrow = axes[irow]
-            clabel = 'I (mA/cm2)' if curr_polarity == 'original' else '|I| (mA/cm2)'
-            axrow[0].set_ylabel(clabel)
+            clabel = '|I|' if rectify_currents else 'I'
+            axrow[0].set_ylabel(f'{clabel} (uA/cm2)')
             zorders = dict(zip(
                 self.record_dict['currents'].keys(),
                 np.arange(len(self.record_dict['currents'].keys()))[::-1]
             ))
             for ckey, color in zip(self.record_dict['currents'], plt.get_cmap('tab10').colors):
-                if ckey in timeseries:
+                if ckey in timeseries and ckey != 'iNoise':
+                    # Determine sign switch for current
                     sign = 1
-                    if curr_polarity == 'rectified' and ckey in self.RECTIFIED_CURRENTS:
+                    if rectify_currents and ckey in self.RECTIFIED_CURRENTS:
                         sign = -1
-                    alpha = 0.5 if ckey == 'iNoise' else 1. 
+                    
+                    # Determine alpha value for current
+                    alpha = 1.
+                    if clip_currents and ckey in self.CLIPPED_CURRENTS:
+                        alpha = 0.5
+                    
+                    # Plot current time course per node
                     for iax, (ax, (_, current)) in enumerate(zip(axrow, timeseries[ckey].groupby(self.NODE_KEY))):
-                        s = sign * current.droplevel(self.NODE_KEY)
+                        s = sign * current.droplevel(self.NODE_KEY) * 1e3  # uA/cm2
                         s.plot(
                             ax=ax, label=f'$i_{{{ckey[1:]}}}$', color=color, alpha=alpha, zorder=zorders[ckey])
                         if ckey not in self.CLIPPED_CURRENTS:
                             bounds_per_ax[iax, 0] = min(bounds_per_ax[iax, 0], s.min())
                             bounds_per_ax[iax, 1] = max(bounds_per_ax[iax, 1], s.max())
                     ncurrs += 1
+            
+            # If net current requested, plot it on top
+            if add_net_current:
+                for ax, (_, idata) in zip(axrow, timeseries['iNet'].groupby(self.NODE_KEY)):
+                    s = idata.droplevel(self.NODE_KEY) * 1e3  # uA/cm2
+                    s.plot(ax=ax, label='$i_{net}$', color='k', ls='--', zorder=30)
+                ncurrs += 1
             
             # If currents clipping requested
             if clip_currents:
@@ -1821,8 +2069,8 @@ class NeuralNetwork:
                 # If y range is non-zero
                 if yrange > 0:
                     # Add relative margin to y-axis bounds
-                    exp_factor = 0.1
-                    exp_ybounds = np.array([ybounds[0] - yrange * exp_factor, ybounds[1] + yrange * exp_factor])
+                    yextra = 0.1 * yrange
+                    exp_ybounds = np.array([ybounds[0] - yextra, ybounds[1] + yextra])
 
                     # Set y-bounds to be symmetric around 0
                     if exp_ybounds[0] * exp_ybounds[1] < 0:
@@ -1907,7 +2155,7 @@ class NeuralNetwork:
         :param kind: stimulus distribution kind (default: 'uniform'). One of:
             - "single": single node stimulated
             - "uniform": all nodes stimulated with equal intensity
-            - integer: custom number of nodes stimulated with equal intensity
+            - integer/float: custom fraction of nodes stimulated with equal intensity
         :return: stimulus distribution vector
         '''        
         # Return stimulus distribution vector
@@ -1917,11 +2165,13 @@ class NeuralNetwork:
             return x
         elif kind == 'uniform':
             return np.ones(self.size)
-        elif isinstance(kind, int):
-            if kind > self.size:
-                raise ValueError(f'Number of stimulated nodes ({kind}) cannot exceed number of nodes ({self.size})')
+        elif isinstance(kind, (int, float)):
+            frac = kind
+            if frac < 0 or frac > 1:
+                raise ValueError(f'Invalid stimulus distribution fraction: {frac}')
+            inodes = np.random.choice(self.inodes, int(frac * self.size), replace=False)
             x = np.zeros(self.size)
-            x[:kind] = 1.
+            x[inodes] = 1.
             return x 
         else:
             raise ValueError(f'Invalid stimulus distribution kind: {kind}')
@@ -2291,15 +2541,18 @@ class NeuralNetwork:
         # Remove units from currents names
         df.columns = df.columns.str.rstrip('(mA/cm2)').str.rstrip(' ')
 
+        # Convert to uA/cm2 
+        df = df * 1e3
+
         # Create / retrieve figure and axis
         if ax is None:
             fig, ax = plt.subplots(figsize=(3, 2))
         else:
             fig = ax.get_figure()
         sns.despine(ax=ax)
-        
+
         # Plot currents
-        ax.set_ylabel('|I| (mA/cm2)')
+        ax.set_ylabel('|I| (uA/cm2)')
         colors = list(plt.get_cmap('tab20').colors)
         palette = {
             'iStim': colors[0],
@@ -2519,7 +2772,7 @@ class NeuralNetwork:
         )
 
         # Plot Isppa dependencies
-        logger.info('plotting Isppa dependencies...')
+        self.log('plotting Isppa dependencies...')
         fg = sns.FacetGrid(
             mdata.reset_index(),
             row='w (uS/cm2)',
