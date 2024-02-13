@@ -2,12 +2,13 @@
 # @Author: Theo Lemaire
 # @Date:   2023-08-17 16:10:10
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-12-08 17:30:42
+# @Last Modified time: 2024-02-13 10:30:15
 
 ''' General utility functions. '''
 
 import numpy as np
 import pandas as pd
+from scipy.interpolate import interp1d
 
 
 def pressure_to_intensity(p, rho=1046.0, c=1546.3):
@@ -85,3 +86,85 @@ def signed_sqrt(x):
 def sqrtspace(start, stop, n):
     ''' Generate range of values linearly spaced in sqrt space '''
     return np.linspace(np.sqrt(start), np.sqrt(stop), n)**2
+
+
+def restrict_trace(x, y, ymin, ymax, full_output=False):
+    '''
+    Restrict a time course to a given range of values by 
+    (1) setting values outside the range to NaN, and
+    (2) adding interpolated points at the boundaries.
+
+    :param x: time vector
+    :param y: value vector
+    :param ymin: minimal value
+    :param ymax: maximal value
+    :param full_output: whether to return also return a dictionary of booleans
+     indicating whether trace is clipped on each y boundary
+    :return: restricted time and value vectors (and optional dictionary of booleans)
+    '''
+    # Set up boundaries dictionary
+    ylims = {'lb': ymin, 'ub': ymax}
+
+    # Create boolean masks for values above and below the bounds
+    masks = {
+        'lb': y < ylims['lb'],
+        'ub': y > ylims['ub']
+    }
+
+    # Determine if any values fall on either side of the bounds
+    is_clipped = {k: mask.any() for k, mask in masks.items()}
+
+    # If values fall outside the bounds
+    if any(is_clipped.values()):
+
+        # Find the indices where the trajectory crosses the bounds
+        transitions = []
+        for kind, mask in masks.items():
+            mask_diff = np.diff(mask.astype(int))
+            idxs = np.where(mask_diff != 0)[0]
+            transitions.append(
+                pd.Series(index=idxs, data=kind, name='kind'))
+        transitions = pd.concat(transitions, axis=0).sort_index()
+
+        # Copy x and y arrays into points dataframe, and set 
+        # out-of-bounds y values to NaN
+        points = pd.DataFrame({'x': x, 'y': y})
+        for kind, mask in masks.items():
+            points['y'][mask] = np.nan
+
+        # Add interpolated points at the locations of boundary crossings
+        for i, kind in transitions.items():
+            yb = ylims[kind]
+            finterp = interp1d(y[i:i + 2], x[i:i + 2])
+            points.loc[len(points)] = (finterp(yb), yb)
+
+        # Sort points by x value
+        points = points.sort_values(by='x')
+
+        # Extract new x and y arrays
+        x, y = points['x'].values, points['y'].values
+
+    # Return
+    if full_output:
+        return x, y, is_clipped
+    else:
+        return x, y
+
+
+def expand_range(x, factor=0.1):
+    '''
+    Expand range by relative factor around its center point
+
+    :param x: range bounds vector
+    :param factor: relative expansion factor (default: 0.1)
+    :return: expanded range bounds vector
+    '''
+    # Unpack bounds
+    lb, ub = x
+    # Compute center and halfwidth
+    center = (lb + ub) / 2
+    halfwidth = (ub - lb) / 2
+    # Expand halfwidth
+    halfwidth *= (1 + factor)
+    # Return expanded bounds
+    return np.array([center - halfwidth, center + halfwidth])

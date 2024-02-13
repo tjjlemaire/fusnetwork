@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2023-12-20 15:25:10
+# @Last Modified time: 2024-02-13 10:34:34
 
 # External imports
 import sys
@@ -1865,7 +1865,8 @@ class NeuralNetwork:
         return timeseries[keys]
 
     def plot_results(self, data, tref='onset', gmode='abs', addstimspan=True, title=None, 
-                     rectify_currents=False, clip_currents=False, add_net_current=False, **kwargs):
+                     rectify_currents=False, clip_currents=False, add_net_current=False, 
+                     add_spikes=False, hrow=1.5, wcol=2, **kwargs):
         '''
         Plot the time course of variables recorded during simulation.
         
@@ -1911,8 +1912,6 @@ class NeuralNetwork:
         hasvoltages = 'v' in timeseries
 
         # Create figure with appropriate number of rows and columns
-        hrow = 1.5
-        wcol = 3
         nrows = int(hasstim) + int(hastemps) + int(hasconds) + int(hascurrs) + int(hasvoltages)
         nnodes_out = len(timeseries.index.unique(self.NODE_KEY))
         assert nnodes_out == self.size, f'number of nodes ({self.size}) does not match number of output voltage traces ({nnodes_out})'
@@ -1927,6 +1926,14 @@ class NeuralNetwork:
         if ncols == 1:
             axes = np.atleast_2d(axes).T
         sns.despine(fig=fig)
+        for ax in axes[:-1].flatten():
+            ax.spines['bottom'].set_visible(False)
+            ax.tick_params(axis='x', which='both', bottom=False, top=False, labelbottom=False)
+        for ax in axes[:, 1:].flatten():
+            ax.spines['left'].set_visible(False)
+            ax.tick_params(axis='y', which='both', left=False, right=False, labelleft=False)
+        for ax in axes[:, 0]:
+            ax.spines['left'].set_position(('outward', 5))
         for ax in axes[-1]:
             ax.set_xlabel(self.TIME_KEY)
         for inode, ax in enumerate(axes[0]):
@@ -1966,6 +1973,10 @@ class NeuralNetwork:
                         ax.axvspan(
                             *stimbounds, fc='silver', ec=None, alpha=.3,
                             label='bounds' if irow == 0 else None)
+            
+            # Set x-axis ticks to stimulus bounds
+            for ax in axes[-1]:
+                ax.set_xticks(stimbounds)
         
         # Initialize axis row index
         irow = 0
@@ -2040,8 +2051,8 @@ class NeuralNetwork:
                     
                     # Determine alpha value for current
                     alpha = 1.
-                    if clip_currents and ckey in self.CLIPPED_CURRENTS:
-                        alpha = 0.5
+                    # if clip_currents and ckey in self.CLIPPED_CURRENTS:
+                    #     alpha = 0.5
                     
                     # Plot current time course per node
                     for iax, (ax, (_, current)) in enumerate(zip(axrow, timeseries[ckey].groupby(self.NODE_KEY))):
@@ -2068,15 +2079,40 @@ class NeuralNetwork:
 
                 # If y range is non-zero
                 if yrange > 0:
-                    # Add relative margin to y-axis bounds
-                    yextra = 0.1 * yrange
-                    exp_ybounds = np.array([ybounds[0] - yextra, ybounds[1] + yextra])
+                    # Compute symmetric y bounds if y range is on both sides of 0
+                    if ybounds[0] * ybounds[1] < 0:
+                        ybounds = np.array([-max(np.abs(ybounds)), max(np.abs(ybounds))])
 
-                    # Set y-bounds to be symmetric around 0
-                    if exp_ybounds[0] * exp_ybounds[1] < 0:
-                        exp_ybounds = np.array([-max(np.abs(exp_ybounds)), max(np.abs(exp_ybounds))])
+                    # Add relative margin to y-axis bounds for clipping
+                    ybounds = expand_range(ybounds, factor=0.1)
 
-                    # Apply to first axis (sharey should adjust other axes)
+                    # Loop through axes
+                    for ax in axrow:
+                        # Set dictionary of clipping status for any trace
+                        is_any_clipped = {'lb': False, 'ub': False}
+                        
+                        # Loop through current traces
+                        for line in ax.lines:
+                            # Clip current trace while adding new data points 
+                            # at locations where the trace crosses the restricted y bounds
+                            # (to preserve the trace appearance within the y range)
+                            xdata, ydata, is_clipped = restrict_trace(
+                                line.get_xdata(), line.get_ydata(), *ybounds, 
+                                full_output=True)
+                            line.set_data(xdata, ydata)
+
+                            # Update clipping status
+                            for k, v in is_clipped.items():
+                                is_any_clipped[k] |= v
+                        
+                        # Add dash horizontal lines at clipped y bounds
+                        for (k, v), yb in zip(is_any_clipped.items(), ybounds):
+                            if v:
+                                ax.axhline(yb, c='k', ls='--', lw=0.5)
+
+                    # Set y-axis clipping bounds with extra margin
+                    exp_ybounds = expand_range(ybounds, factor=0.1)
+                    # Set new y limits to first axis (sharey should adjust other axes)
                     axrow[0].set_ylim(*exp_ybounds)
             
             axrow[-1].legend(ncols=int(np.ceil(ncurrs / 4)), **leg_kwargs)
@@ -2089,31 +2125,34 @@ class NeuralNetwork:
             for ax, (node, v) in zip(axrow, timeseries['v'].groupby(self.NODE_KEY)):
                 v = v.droplevel(self.NODE_KEY) 
                 ax.plot(v.index, v.values, c='k')
-                # Detect spikes timings
-                aptimes = self.extract_ap_times(v.index, v.values)
+                if add_spikes:
+                    # Detect spikes timings
+                    aptimes = self.extract_ap_times(v.index, v.values)
 
-                # If pre-synaptic drive events
-                if events is not None:
-                    # Plot pre-synaptic drive events raster
-                    self.add_events_raster(
-                        ax, events.loc[node], y=85, color='dimgray', label='drive evts.')                    
-                    # Classify spikes as "artificial" or "real"
-                    is_artificial = self.detect_artificial_spikes(aptimes, events.loc[node])
-                    # Plot raster for each spike type
-                    for is_art, color, label in zip([True, False], ['k', 'g'], ['art. spikes', 'evoked spikes']):
-                        ts = aptimes[is_artificial == is_art]
-                        if len(ts) > 0:
-                            self.add_events_raster(ax, ts, y=70, color=color, label=label)                
-                # Otherwise, plot all spikes
-                else:
-                    self.add_events_raster(
-                        ax, aptimes, y=70, color='k', label='spikes')
+                    # If pre-synaptic drive events
+                    if events is not None:
+                        # Plot pre-synaptic drive events raster
+                        self.add_events_raster(
+                            ax, events.loc[node], y=85, color='dimgray', label='drive evts.')                    
+                        # Classify spikes as "artificial" or "real"
+                        is_artificial = self.detect_artificial_spikes(aptimes, events.loc[node])
+                        # Plot raster for each spike type
+                        for is_art, color, label in zip([True, False], ['k', 'g'], ['art. spikes', 'evoked spikes']):
+                            ts = aptimes[is_artificial == is_art]
+                            if len(ts) > 0:
+                                self.add_events_raster(ax, ts, y=70, color=color, label=label)                
 
+                    # Otherwise, plot all spikes
+                    else:
+                        self.add_events_raster(
+                            ax, aptimes, y=70, color='k', label='spikes')
 
                 # Force minimal y-axis limits
                 yb, yt = ax.get_ylim()
                 ax.set_ylim(min(yb, -80), max(yt, 50))
-            axrow[-1].legend(**leg_kwargs)
+            
+            if add_spikes:
+                axrow[-1].legend(**leg_kwargs)
             irow += 1
 
         # Add figure title, if specified
