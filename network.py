@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2024-02-13 10:34:34
+# @Last Modified time: 2024-10-22 23:39:01
 
 # External imports
 import sys
@@ -12,6 +12,7 @@ import warnings
 from tqdm import tqdm
 import numpy as np
 from scipy.interpolate import interp1d
+from scipy import integrate
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
@@ -152,11 +153,13 @@ class NeuralNetwork:
         },
     }
 
+    CURRENT_KEYS = [c[1:] for c in record_dict['currents'].keys()]
+
     RECTIFIED_CURRENTS = [  # currents that should be rectified
         'iDrive', 
         'iNa', 
         'iStim'
-    ]  
+    ]
     CLIPPED_CURRENTS = [   # currents that should be clipped upon plotting
         'iNa', 
         'iKd', 
@@ -172,6 +175,16 @@ class NeuralNetwork:
     ]
 
     TIMEVAR_SUFFIX = '_t'  # suffix to add to time-varying conductance variables
+
+    CURRENTS_CMAP = {  # Colormap of currents
+        'iStim': 'C7',
+        'iNa': 'C0',
+        'iKd': 'C1',
+        'iSyn': 'C2',
+        'iM': 'C3',
+        'iKT': 'C4',
+        'iLeak': 'C5',
+    }
 
     @classmethod
     def record_keys(cls, kind):
@@ -872,20 +885,21 @@ class NeuralNetwork:
 
         # If variable is synaptic current
         if varname == 'iSyn':
-            logger.debug(f'recording post-synaptic currents')
-            # Initialize recording probes list for synaptic currents
-            self.probes[varkey] = []
-            # For each post-synaptic node
-            for ipostnode in self.inodes:
-                plist = []
-                # For each pre-synaptic node
-                for iprenode in self.inodes:
-                    # If connection exists
-                    if self.connections[iprenode, ipostnode] is not None:
-                        # record synaptic current
-                        plist.append(
-                            self.get_probe(self.connections[iprenode, ipostnode][0]._ref_i))
-                self.probes[varkey].append(plist)
+            if self.connections is not None:
+                logger.debug(f'recording post-synaptic currents')
+                # Initialize recording probes list for synaptic currents
+                self.probes[varkey] = []
+                # For each post-synaptic node
+                for ipostnode in self.inodes:
+                    plist = []
+                    # For each pre-synaptic node
+                    for iprenode in self.inodes:
+                        # If connection exists
+                        if self.connections[iprenode, ipostnode] is not None:
+                            # record synaptic current
+                            plist.append(
+                                self.get_probe(self.connections[iprenode, ipostnode][0]._ref_i))
+                    self.probes[varkey].append(plist)
         
         # If variable is noise current 
         elif varname == 'iNoise':
@@ -1502,6 +1516,55 @@ class NeuralNetwork:
 
         return data
     
+    def is_excited(self, I):
+        '''
+        Check whether network is excited (i.e., at least 1 AP in at least 1 node) at a given stimulation intensity
+
+        :param I: stimulus intensity (W/cm2)
+        :return: boolean
+        '''
+        self.set_stim(I)
+        data = self.simulate()
+        return self.compute_metric(data, 'nspikes').max() > 0
+    
+    def find_spiking_threshold(self, Imax=5e2, rtol=.05):
+        '''
+        Find threshold intensity driving a network response (i.e., at least 1 AP in at least 1 node)
+
+        :param Imax: upper bound of intensity search range (W/cm2)
+        :param rtol: relative tolerance for threshold estimation, i.e. (Iout - Ithr) / Ithr < rtol
+        :return: threshold intensity (W/cm2)
+        '''
+        # Define search interval
+        Ibounds = [0, Imax]
+
+        self.log(f'finding response thresold intensity within {Ibounds} W/cm2 interval')
+        # Turn off verbosity temporarily
+        vb = self.verbose
+        self.verbose = False
+
+        # Check that upper bound intensity generates at least 1 spike 
+        if not self.is_excited(Imax):
+            raise ValueError(f'no response detected up to I = {Imax:.2f} W/cm2')
+
+        # Set up binary search
+        conv = False
+        while not conv:
+            rel_var = (Ibounds[1] - Ibounds[0]) / Ibounds[1]
+            I = (Ibounds[0] + Ibounds[1]) / 2
+            if self.is_excited(I):
+                if rel_var < rtol:
+                    conv = True
+                Ibounds[1] = I
+            else:
+                Ibounds[0] = I
+        
+        # Reset verbosity
+        self.verbose = vb
+
+        # Return threshold intensity
+        return I
+    
     def extract_ap_times(self, t, v, vref=0):
         '''
         Extract action potential times from a given voltage trace. 
@@ -1768,6 +1831,12 @@ class NeuralNetwork:
             - list of node indexes
         :return: array(s) of metric value per node
         '''
+        # If multiple metrics requested, call function for each of them
+        if is_iterable(metric):
+            mdict = {m: self.compute_metric(data, m, inodes=inodes) for m in metric}
+            mdict = {m: v.to_frame() if isinstance(v, pd.Series) else v for m, v in mdict.items()}
+            return pd.concat(mdict, axis=1)
+        
         # Unpack data
         if isinstance(data, tuple):
             timeseries, events = data
@@ -1825,19 +1894,22 @@ class NeuralNetwork:
             m = tuple((np.asarray(mm) - freq) / freq for mm in m)
         elif metric == self.RESP_KEY:
             m = self.extract_stim_response(timeseries)
+        elif metric == 'charge':
+            m = self.compute_charge(timeseries)
         else:
             raise ValueError(f'Invalid metric: {metric}')
 
         # If metric is a tuple, convert to mean - err dataframe  
         if isinstance(m, tuple):
             m = pd.DataFrame({'mean': m[0], 'err': m[1]}).add_suffix(f' {metric}')
-        # Otherwise, convert to series
-        else:
+
+        # If metric is array/list, convert to series
+        elif isinstance(m, (np.ndarray, list)):
             m = pd.Series(m, name=metric)
-        
-        # Set index
-        m.index = inodes
-        m.index.name = self.NODE_KEY
+
+        # If metric has not specific index, define it
+        if m.index.name is None:
+           m.index = pd.Index(inodes, name=self.NODE_KEY)
 
         # Return
         return m
@@ -1863,10 +1935,91 @@ class NeuralNetwork:
 
         # Return filtered output dataframe
         return timeseries[keys]
+    
+    def integrate_current(self, i):
+        '''
+        Integrate current density vector
+
+        :param i: current density vector (in mA/cm2) provided as a time (ms)-indexed pandas series 
+        :return: charge density (in uC/cm2)
+        '''
+        if not isinstance(i, pd.Series) or i.index.name != self.TIME_KEY:
+            raise ValueError(f'input current must be a time-indexed series')
+        return integrate.trapezoid(i.values, x=i.index.values)  # mA/cm2 * ms = uC/cm2
+    
+    def compute_charge(self, data, tbounds=None):
+        '''
+        Compute charge injected by each current within a time interval 
+
+        :param data: multi-indexed simulation output dataframe (and potential presynaptic drive events)
+        :param tbounds: time interval to consider to charge computation: either a tuple of time values, or "half2"  
+        :return: dataframe of accumulated charges per current
+        '''
+        # Unpack input data
+        if isinstance(data, tuple):
+            timeseries, _ = data
+        else:
+            timeseries = data
+
+        # If time bounds provided, filter timeseries
+        if tbounds is not None:
+            # If tbounds is a string code, convert to float interval
+            if isinstance(tbounds, str):
+                if tbounds.startswith('stim'):
+                    tb = [self.start, self.start + self.dur]
+                    if tbounds == 'stimhalf1':
+                        tb[1] = self.start + self.dur / 2
+                    elif tbounds == 'stimhalf2':
+                        tb[0] = self.start + self.dur / 2
+                    tbounds = tb
+                else: 
+                    raise ValueError(f'invalid tbounds code: {tbounds}')
+            tidx = timeseries.index.get_level_values(self.TIME_KEY)
+            isin = np.logical_and(tidx >= tbounds[0], tidx <= tbounds[1])
+            timeseries = timeseries[isin]
+        
+        # Check that currents are in timeseries data
+        hascurrs = 'currents' in self.record_dict and any(k in timeseries for k in self.record_dict['currents'])
+        if not hascurrs: 
+            raise ValueError('no current found in input data')
+        
+        # Initialize charges dictionary
+        charges = {}
+
+        # Identify non-time keys in timeseries
+        gby = [k for k in timeseries.index.names if k != self.TIME_KEY]
+        
+        # Loop through currents and integrate to compute charges
+        for ckey in self.record_dict['currents']:
+            if ckey in timeseries and ckey != 'iNoise':
+                charges[ckey] = (
+                    timeseries[ckey]
+                    .groupby(gby)
+                    .agg(lambda i: self.integrate_current(i.droplevel(gby)))
+                )
+        
+        # Assemble into dataframe
+        charges = pd.concat(charges, axis=1, names='current')
+
+        # Return charges
+        return charges
+    
+    def compute_charge_by_stimhalf(self, data, **kwargs):
+        ''' Compute injected charges by each current in first and second half of stimulus '''
+        thalfs = {
+            1: 'stimhalf1',
+            2: 'stimhalf2'
+        }
+        charges = pd.concat(
+            {k: self.compute_charge(data, tbounds=v, **kwargs) for k, v in thalfs.items()},
+            axis=0,
+            names=['stim. half']
+        )
+        return charges
 
     def plot_results(self, data, tref='onset', gmode='abs', addstimspan=True, title=None, 
                      rectify_currents=False, clip_currents=False, add_net_current=False, 
-                     add_spikes=False, hrow=1.5, wcol=2, **kwargs):
+                     add_spikes=False, hrow=1.5, wcol=2, lw=1, **kwargs):
         '''
         Plot the time course of variables recorded during simulation.
         
@@ -1911,11 +2064,23 @@ class NeuralNetwork:
         hascurrs = 'currents' in self.record_dict and any(k in timeseries for k in self.record_dict['currents'])
         hasvoltages = 'v' in timeseries
 
-        # Create figure with appropriate number of rows and columns
-        nrows = int(hasstim) + int(hastemps) + int(hasconds) + int(hascurrs) + int(hasvoltages)
+        # Check that number of nodes in output corresponds to model size
         nnodes_out = len(timeseries.index.unique(self.NODE_KEY))
         assert nnodes_out == self.size, f'number of nodes ({self.size}) does not match number of output voltage traces ({nnodes_out})'
-        ncols = self.size
+        colkey = self.NODE_KEY
+        dropkey = colkey
+        
+        # if only 1 node, check if extra dimension can be used for columns
+        if nnodes_out == 1:
+            extra_dims = [k for k in timeseries.index.names if k not in [self.NODE_KEY, self.TIME_KEY]]
+            if len(extra_dims) > 0:
+                colkey = extra_dims[0]
+                dropkey = [colkey, self.NODE_KEY]
+
+        # Create figure with appropriate number of rows and columns
+        nrows = int(hasstim) + int(hastemps) + int(hasconds) + int(hascurrs) + int(hasvoltages)
+        
+        ncols = len(timeseries.index.unique(colkey))
         fig, axes = plt.subplots(
             nrows, 
             ncols, 
@@ -1936,8 +2101,8 @@ class NeuralNetwork:
             ax.spines['left'].set_position(('outward', 5))
         for ax in axes[-1]:
             ax.set_xlabel(self.TIME_KEY)
-        for inode, ax in enumerate(axes[0]):
-            ax.set_title(f'node {inode}')
+        for (v, _), ax in zip(data.groupby(colkey), axes[0]):
+            ax.set_title(f'{colkey} = {v}')
 
         # Define legend keyword arguments
         leg_kwargs = dict(
@@ -1948,10 +2113,11 @@ class NeuralNetwork:
 
         # If stimulus timeseries data exists
         if hasstim:
-            # Extract max stimulus intensity per node, and complete column titles
-            Isppas = timeseries[self.STIM_KEY].groupby(self.NODE_KEY).max()
-            for ax, Isppa in zip(axes[0], Isppas):
-                ax.set_title(f'{ax.get_title()}: {Isppa:.0f} W/cm2')
+            # Extract max stimulus intensity per column, and complete column titles
+            Isppas = timeseries[self.STIM_KEY].groupby(colkey).max()
+            if colkey == self.NODE_KEY:
+                for ax, Isppa in zip(axes[0], Isppas):
+                    ax.set_title(f'{ax.get_title()}: {Isppa:.0f} W/cm2')
             
             # Extract stimulus bounds            
             tvec, _ = self.get_stim_vecs()
@@ -1981,24 +2147,24 @@ class NeuralNetwork:
         # Initialize axis row index
         irow = 0
 
-        # Plot stimulus time-course per node
+        # Plot stimulus time-course per column
         if hasstim:
             axrow = axes[irow]
             axrow[0].set_ylabel(self.ISPPA_KEY)
-            for ax, (_, stim) in zip(axrow, timeseries[self.STIM_KEY].groupby(self.NODE_KEY)):
-                stim.droplevel(self.NODE_KEY).plot(ax=ax, c='k')
+            for ax, (_, stim) in zip(axrow, timeseries[self.STIM_KEY].groupby(colkey)):
+                stim.droplevel(dropkey).plot(ax=ax, c='k', lw=lw)
             axrow[-1].legend(**leg_kwargs)
             irow += 1
 
-        # Plot temperature time-course per node
+        # Plot temperature time-course per column
         if hastemps:
             axrow = axes[irow]
             axrow[0].set_ylabel('T (°C)')
-            for ax, (_, T) in zip(axrow, timeseries['T'].groupby(self.NODE_KEY)):
-                T.droplevel(self.NODE_KEY).plot(ax=ax, c='k')
+            for ax, (_, T) in zip(axrow, timeseries['T'].groupby(colkey)):
+                T.droplevel(dropkey).plot(ax=ax, c='k', lw=lw)
             irow += 1
 
-        # For each channel type, plot conductance time course per node
+        # For each channel type, plot conductance time course per column
         if hasconds:
             axrow = axes[irow]
             if gmode == 'rel':
@@ -2010,8 +2176,8 @@ class NeuralNetwork:
             axrow[0].set_ylabel(ylabel)
             for condkey, color in zip(self.record_dict['conductances'], plt.get_cmap('Dark2').colors):
                 if condkey in timeseries:
-                    for ax, (_, g) in zip(axrow, timeseries[condkey].groupby(self.NODE_KEY)):
-                        g = g.droplevel(self.NODE_KEY)
+                    for ax, (_, g) in zip(axrow, timeseries[condkey].groupby(colkey)):
+                        g = g.droplevel(dropkey)
                         if condkey.endswith('bar'):
                             label = f'\overline{{g_{{{condkey[1:-3]}}}}}'
                         else:
@@ -2024,14 +2190,14 @@ class NeuralNetwork:
                                 g = g / g.iloc[0] * 100
                         elif gmode == 'norm':
                             g = g / g.max() * 100
-                        g.plot(ax=ax, label=f'${label}$', color=color)
+                        g.plot(ax=ax, label=f'${label}$', color=color, lw=lw)
             axrow[-1].legend(**leg_kwargs)
             if gmode == 'log':
                 for ax in axrow:
                     ax.set_yscale('log')
             irow += 1
 
-        # For each channel type, plot current time course per node
+        # For each channel type, plot current time course per column
         if hascurrs:
             bounds_per_ax = np.zeros((len(axes[irow]), 2))
             ncurrs = 0
@@ -2042,8 +2208,9 @@ class NeuralNetwork:
                 self.record_dict['currents'].keys(),
                 np.arange(len(self.record_dict['currents'].keys()))[::-1]
             ))
-            for ckey, color in zip(self.record_dict['currents'], plt.get_cmap('tab10').colors):
+            for ckey in self.record_dict['currents']:
                 if ckey in timeseries and ckey != 'iNoise':
+                    color = self.CURRENTS_CMAP[ckey]
                     # Determine sign switch for current
                     sign = 1
                     if rectify_currents and ckey in self.RECTIFIED_CURRENTS:
@@ -2054,11 +2221,11 @@ class NeuralNetwork:
                     # if clip_currents and ckey in self.CLIPPED_CURRENTS:
                     #     alpha = 0.5
                     
-                    # Plot current time course per node
-                    for iax, (ax, (_, current)) in enumerate(zip(axrow, timeseries[ckey].groupby(self.NODE_KEY))):
-                        s = sign * current.droplevel(self.NODE_KEY) * 1e3  # uA/cm2
+                    # Plot current time course per column
+                    for iax, (ax, (_, current)) in enumerate(zip(axrow, timeseries[ckey].groupby(colkey))):
+                        s = sign * current.droplevel(dropkey) * 1e3  # uA/cm2
                         s.plot(
-                            ax=ax, label=f'$i_{{{ckey[1:]}}}$', color=color, alpha=alpha, zorder=zorders[ckey])
+                            ax=ax, label=f'$i_{{{ckey[1:]}}}$', color=color, alpha=alpha, zorder=zorders[ckey], lw=lw)
                         if ckey not in self.CLIPPED_CURRENTS:
                             bounds_per_ax[iax, 0] = min(bounds_per_ax[iax, 0], s.min())
                             bounds_per_ax[iax, 1] = max(bounds_per_ax[iax, 1], s.max())
@@ -2066,9 +2233,9 @@ class NeuralNetwork:
             
             # If net current requested, plot it on top
             if add_net_current:
-                for ax, (_, idata) in zip(axrow, timeseries['iNet'].groupby(self.NODE_KEY)):
-                    s = idata.droplevel(self.NODE_KEY) * 1e3  # uA/cm2
-                    s.plot(ax=ax, label='$i_{net}$', color='k', ls='--', zorder=30)
+                for ax, (_, idata) in zip(axrow, timeseries['iNet'].groupby(colkey)):
+                    s = idata.droplevel(dropkey) * 1e3  # uA/cm2
+                    s.plot(ax=ax, label='$i_{net}$', color='k', ls='--', zorder=30, lw=lw)
                 ncurrs += 1
             
             # If currents clipping requested
@@ -2118,24 +2285,24 @@ class NeuralNetwork:
             axrow[-1].legend(ncols=int(np.ceil(ncurrs / 4)), **leg_kwargs)
             irow += 1
 
-        # Plot membrane potential time-course per node
+        # Plot membrane potential time-course per column
         if hasvoltages:
             axrow = axes[irow]
             axrow[0].set_ylabel('Vm (mV)')
-            for ax, (node, v) in zip(axrow, timeseries['v'].groupby(self.NODE_KEY)):
-                v = v.droplevel(self.NODE_KEY) 
-                ax.plot(v.index, v.values, c='k')
+            for ax, (k, v) in zip(axrow, timeseries['v'].groupby(colkey)):
+                v = v.droplevel(dropkey)
+                v.plot(ax=ax, c='k', lw=lw)
+                
                 if add_spikes:
                     # Detect spikes timings
                     aptimes = self.extract_ap_times(v.index, v.values)
-
                     # If pre-synaptic drive events
                     if events is not None:
                         # Plot pre-synaptic drive events raster
                         self.add_events_raster(
-                            ax, events.loc[node], y=85, color='dimgray', label='drive evts.')                    
+                            ax, events.loc[k], y=85, color='dimgray', label='drive evts.')                    
                         # Classify spikes as "artificial" or "real"
-                        is_artificial = self.detect_artificial_spikes(aptimes, events.loc[node])
+                        is_artificial = self.detect_artificial_spikes(aptimes, events.loc[k])
                         # Plot raster for each spike type
                         for is_art, color, label in zip([True, False], ['k', 'g'], ['art. spikes', 'evoked spikes']):
                             ts = aptimes[is_artificial == is_art]
@@ -2739,7 +2906,7 @@ class NeuralNetwork:
         else:
             ax2.set_xticklabels([])
     
-    def run_comparative_sweep(self, Isppas, metric, stimdists=None, **kwargs):
+    def run_comparative_sweep(self, Isppas, metric, stimdists=None, sigmaI=None, **kwargs):
         '''
         Compute metric over Isppa sweep for both single node and uniform stimulus distributions,
 
@@ -2758,6 +2925,9 @@ class NeuralNetwork:
         
         # For each stimulus distribution
         for kind, dist in stimdists.items():
+            # If required, add random variations in relative stimulus amplitudes
+            if sigmaI is not None:
+                dist = np.array([max(np.random.normal(I, sigmaI * I), 0) for I in dist])
             # Run sweep over stimulus intensities, 
             data = self.run_stim_sweep(Isppas, stimdist=dist, **kwargs)
             # Compute metric, and append to list

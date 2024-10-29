@@ -2,13 +2,19 @@
 # @Author: Theo Lemaire
 # @Date:   2023-08-17 16:10:10
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2024-02-13 10:30:15
+# @Last Modified time: 2024-10-20 15:00:50
 
 ''' General utility functions. '''
 
+import os
 import numpy as np
 import pandas as pd
 from scipy.interpolate import interp1d
+import datetime
+import matplotlib.backends.backend_pdf
+from tqdm import tqdm
+
+from logger import logger
 
 
 def pressure_to_intensity(p, rho=1046.0, c=1546.3):
@@ -168,3 +174,22 @@ def expand_range(x, factor=0.1):
     halfwidth *= (1 + factor)
     # Return expanded bounds
     return np.array([center - halfwidth, center + halfwidth])
+
+
+def save_figs_book(figsroot, figs, suffix=None):
+    ''' Save figures dictionary as consecutive pages in single PDF document. '''
+    now = datetime.datetime.now()
+    today = now.strftime('%Y.%m.%d')
+    figsdir = os.path.join(figsroot, today)
+    if not os.path.isdir(figsdir):
+        os.mkdir(figsdir)
+    fcode = 'figs'
+    if suffix is not None:
+        fcode = f'{fcode}_{suffix}'
+    fname = f'{fcode}.pdf'
+    fpath = os.path.join(figsdir, fname)
+    file = matplotlib.backends.backend_pdf.PdfPages(fpath)
+    logger.info(f'saving figures in {fpath}:')
+    for v in tqdm(figs.values()):
+        file.savefig(v, transparent=True, bbox_inches='tight')
+    file.close()
