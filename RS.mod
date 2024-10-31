@@ -11,23 +11,24 @@ NEURON {
     NONSPECIFIC_CURRENT iKd : delayed-rectifier Potassium current
     NONSPECIFIC_CURRENT iLeak : non-specific leakage current
     NONSPECIFIC_CURRENT iM : slow non-inactivating Potassium current
-    NONSPECIFIC_CURRENT iNaKPump : Sodium-potassium pump current
     NONSPECIFIC_CURRENT iStim : Stimulus-driven depolarizing current
     NONSPECIFIC_CURRENT iKT : Thermally-driven Potassium current
 
     : Python-accessible parameters/variables
-    RANGE I : stimulus parameters
-    : RANGE iStimbar, iStimx0, iStimdx : stimulus-driven current parameters
+    RANGE Z : physical constants
+    RANGE Pamp : stimulus parameters
     RANGE a, b :  stimulus-driven current parameters
     RANGE Tref, alphaT, tauT_abs, tauT_diss  : thermal model parameters
     RANGE Q10_rates, Q10_gNa, Q10_gKd, Q10_gNaK  : temperature dependence parameters
     RANGE gLeak, gNabar, gKdbar, gMbar : ion channel reference maximal conductance parameters
     RANGE gLeak_t, gNabar_t, gKdbar_t, gMbar_t : ion channel maximal conductance variables
-    RANGE gNaKPump, gNaKPump_t : NaK pump parameters and variables 
     RANGE EKT, gKT, gKT_t : KT parameters and variables
 }
 
 PARAMETER {
+    : Physical constants
+    Z = 1.62  : acoustic impedance of brain tissue (MRayl = 1e6*kg/(m^2*s))
+
     : Spiking model parameters 
     ENa = 50.0 (mV) : Sodium reversal potential
     EK = -90.0 (mV) : Potassium reversal potential
@@ -40,14 +41,10 @@ PARAMETER {
     TauMax = 608 (ms) : Max. adaptation decay of slow non-inactivating Potassium current (at 36 deg. C)
 
     : Stimulus parameters
-    I = 0 : time-varying stimulus intensity (a.u.)
+    Pamp = 0 : peak pressure amplitude (MPa)
 
-    : : Stimulus-driven current parameters
-    : iStimbar = 0 (mA/cm2)  : maximal stimulus-driven current amplitude (mA/cm2)
-    : iStimx0 = 200  : stimulus intensity yelding half-maximum stimulus-driven current amplitude (a.u.)
-    : iStimdx = 100  : stimulus intensity range over which stimulus-driven current increases (a.u.)
-    a = 0 : multiplying factor to stimulus-intensity dependency
-    b = 1 : exponent to stimulus-intensity dependency
+    : Stimulus-driven current parameters
+    a = 0 : multiplying factor for stimulus sensitivity on pressure (mA/cm2 * MPa)
 
     : Thermal model parameters
     Tref = 36  : reference temperature (in deg. C)
@@ -59,12 +56,7 @@ PARAMETER {
     Q10_rates = 1 : temperature dependence of gating transitions
     Q10_gNa = 1 : temperature dependence of iNa maximal conductance
     Q10_gKd = 1 : temperature dependence of iKd maximal conductance
-    Q10_gNaK = 1 : temperature dependence of iNaKPump maximal conductance 
 
-    : Sodium-potassium pump current parameters
-    EPump = -220 (mV) : NaK pump reversal potential
-    gNaKPump = 0 (S/cm2) : NaK pump maximal conductance (at 36 deg. C)
-    
     : Thermally-driven Potassium current parameters
     EKT = -93 (mV)  : KT current reversal potential
     gKT = 0 : rate of KT conductance linear increase with temperature, in S/(cm2 * deg. C)
@@ -89,9 +81,11 @@ ASSIGNED {
     iNa (mA/cm2)
     iKd (mA/cm2)
     iLeak (mA/cm2)
-    iNaKPump (mA/cm2)
     iM (mA/cm2)
     iKT (mA/cm2)
+
+    : Stimulus intensity (W/cm2)
+    Isppa (W/cm2)
 
     : Stimulus-driven current
     iStim (mA/cm2)
@@ -102,7 +96,6 @@ ASSIGNED {
     gMbar_t (S/cm2)
     gLeak_t (S/cm2)
     gKT_t (S/cm2)
-    gNaKPump_t (S/cm2)
 }
 
 : VOLTAGE-DEPENDENT RATE CONSTANT FUNCTIONS TO COMPUTE GATING TRANSITIONS
@@ -154,6 +147,16 @@ FUNCTION taup(v) {
 
 : TEMPERATURE EVOLUTION FUNCTIONS
 
+FUNCTION P2I(P) {  : convert acoustic pressure (in MPa) to acoustic intensity (in W/cm2)
+    : [MPa]^2 / [MRayl] 
+    := (1e6 * [kg/(m*s^2)])^2 / (1e6 * [kg/(m^2*s)])
+    := 1e12 * kg^2/(m^2*s^4)] / (1e6 * [kg/(m^2*s)])
+    := 1e6 [kg/s^3]
+    := 1e6 [W/m2]
+    := 1e2 [W/cm2]
+    P2I = P*P / (2 * Z) * 1e2  : W/cm2
+}
+
 FUNCTION Tinf(I) {
     Tinf = alphaT * I + Tref
 }
@@ -172,16 +175,6 @@ FUNCTION tauT(I) {
 FUNCTION phi(T, Q) {
     : Temperature-dependent rate constant scaling factor
     phi = Q^((T - Tref) / 10)
-} 
-
-FUNCTION sig(x, x0, dx) {
-    : Generic sigmoid function, with inflexion point and width parameters
-    sig = 1 / (1 + exp(-(x - x0) / dx))
-}
-
-FUNCTION exp_cdf(x, dx) {
-    : Exponential cumulative distribution function with scale parameter dx
-    exp_cdf = 1 - exp(-x / dx)
 }
 
 INITIAL {
@@ -192,7 +185,8 @@ INITIAL {
     p = pinf(v)
 
     : Initial temperature
-    T = Tinf(I)
+    Isppa = P2I(Pamp)  : W/cm2
+    T = Tinf(Isppa)  : deg. C
 }
 
 BREAKPOINT {
@@ -204,20 +198,16 @@ BREAKPOINT {
     gNabar_t = gNabar * phi(T, Q10_gNa)
     gKdbar_t = gKdbar * phi(T, Q10_gKd)
     gMbar_t = gMbar * phi(T, Q10_gKd)
-    gNaKPump_t = gNaKPump * phi(T, Q10_gNaK)
     gKT_t = gKT * (T - Tref)
 
     : Stimulus-driven current computation
-    : iStim = - iStimbar * (sig(I, iStimx0, iStimdx) - sig(0, iStimx0, iStimdx))
-    : iStim = - iStimbar * exp_cdf(I, iStimdx)
-    iStim = - a * I^b
+    iStim = - a * Pamp
 
     : Membrane currents computation
     iNa = gNabar_t * m * m * m * h * (v - ENa)
     iKd = gKdbar_t * n * n * n * n * (v - EK)
     iM = gMbar_t * p * (v - EK)
     iLeak = gLeak_t * (v - ELeak)
-    iNaKPump = gNaKPump_t * (v - EPump)
     iKT = gKT_t * (v - EKT)
 }
 
@@ -229,5 +219,6 @@ DERIVATIVE states {
     p' = (pinf(v) - p) / taup(v) * phi(T, Q10_rates)
 
     : Temperature derivative
-    T' = (Tinf(I) - T) / tauT(I)
+    Isppa = P2I(Pamp)  : W/cm2
+    T' = (Tinf(Isppa) - T) / tauT(Isppa)  : deg. C/ms
 }

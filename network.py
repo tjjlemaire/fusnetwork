@@ -2,7 +2,7 @@
 # @Author: Theo Lemaire
 # @Date:   2023-07-13 13:37:40
 # @Last Modified by:   Theo Lemaire
-# @Last Modified time: 2024-10-22 23:39:01
+# @Last Modified time: 2024-10-30 12:03:58
 
 # External imports
 import sys
@@ -96,8 +96,8 @@ def get_NetStim_params(stim):
     }
 
 
-class NeuralNetwork:
-    ''' Interface class to a network of neurons. '''
+class SimplifiedCorticalNetwork:
+    ''' Interface class to a simplified network of cortical neurons. '''
 
     # Conversion factors
     UM_TO_CM = 1e-4
@@ -122,6 +122,7 @@ class NeuralNetwork:
     NODE_KEY = 'node'
     REP_KEY = 'rep'
     RESP_KEY = 'ΔFR/FR'
+    P_MPA_KEY = 'P (MPa)'
     ISPPA_KEY = 'Isppa (W/cm2)'
     DUR_KEY = 'dur (ms)'
 
@@ -137,7 +138,6 @@ class NeuralNetwork:
             'gMbar': 'slow non-inactivating potassium conductance (uS/cm2)',
             'gLeak': 'leak conductance (uS/cm2)',
             'gKT': 'thermally-driven Potassium conductance (uS/cm2)',
-            'gNaKPump': 'sodium-potassium pump conductance (uS/cm2)',
         },
         'currents': {
             'iStim': 'stimulus-driven current (mA/cm2)',
@@ -149,7 +149,6 @@ class NeuralNetwork:
             'iKd': 'potassium current (mA/cm2)',
             'iLeak': 'leak current (mA/cm2)',
             'iNoise': 'noise current (mA/cm2)',
-            'iNaKPump': 'sodium-potassium pump current (mA/cm2)',
         },
     }
 
@@ -329,7 +328,7 @@ class NeuralNetwork:
         Return a copy of the network.
         
         :param nnodes: number of nodes (default: None, i.e. same as original network)
-        :return: NeuralNetwork instance
+        :return: SimplifiedCorticalNetwork instance
         '''
         # If number of nodes not provided, use same as original network
         if nnodes is None:
@@ -1025,10 +1024,15 @@ class NeuralNetwork:
                 vpernode = self.to_current_density(vpernode)
             
             # Create multi-indexed series from 2D array, and append to output dataframe
-            dfout[k] = pd.DataFrame(vpernode.T, columns=self.nodelist, index=t).T.stack()
+            dfout[k] = pd.DataFrame(
+                vpernode.T, 
+                columns=self.nodelist, 
+                index=t
+            ).T.stack()
 
         # Return output dataframe
         dfout.index.names = [self.NODE_KEY, self.TIME_KEY]
+        
         return dfout
 
     @classmethod
@@ -1178,8 +1182,8 @@ class NeuralNetwork:
         # Compute fraction of nodes that will be stimulated
         frac = np.mean(amps > 0)
         A = amps.max()
-        self.log(f'setting {self.dur:.2f} ms stimulus with amplitude {A:.2f} W/cm2 on {frac * 1e2:.1f}% of nodes')
-        # amps_str = self.vecstr(amps, suffix='W/cm2')
+        self.log(f'setting {self.dur:.2f} ms stimulus with amplitude {A:.2f} MPa on {frac * 1e2:.1f}% of nodes')
+        # amps_str = self.vecstr(amps, suffix='MPa')
         # self.log(f'setting {self.dur:.2f} ms stimulus with node-specific amplitudes:\n{amps_str}')
         
         # Set stimulus vectors
@@ -1192,7 +1196,7 @@ class NeuralNetwork:
         # Play stimulus on all nodes with node-specific amplitudes
         for inode in self.inodes:
             self.h_yvecs[inode].play(
-                self.get_var_ref(inode, 'I'), self.h_tvec, True)
+                self.get_var_ref(inode, 'Pamp'), self.h_tvec, True)
     
     def is_stim_set(self):
         ''' Return whether stimulus is set. '''
@@ -1245,10 +1249,11 @@ class NeuralNetwork:
         :return: multi-indexed series storing the interpolated time course
             of the stimulus across nodes
         '''
-        return self.interpolate_vectors(
+        out = self.interpolate_vectors(
             *self.get_stim_vecs(), 
             teval
         ).rename(self.STIM_KEY)
+        return out
     
     def interpolate_noise_data(self, teval):
         '''
@@ -1513,56 +1518,55 @@ class NeuralNetwork:
         #     self.log(f'stimulus response:\n{self.vecstr(stimresp * 100, prefix=f"{self.RESP_KEY} =", suffix="%")}')
         
         # Return continous variables and potential events
-
         return data
     
-    def is_excited(self, I):
+    def is_excited(self, Pamp):
         '''
-        Check whether network is excited (i.e., at least 1 AP in at least 1 node) at a given stimulation intensity
+        Check whether network is excited (i.e., at least 1 AP in at least 1 node) at a given stimulation amplitude
 
-        :param I: stimulus intensity (W/cm2)
+        :param Pamp: peak pressure amplitude (MPa)
         :return: boolean
         '''
-        self.set_stim(I)
+        self.set_stim(Pamp)
         data = self.simulate()
         return self.compute_metric(data, 'nspikes').max() > 0
     
-    def find_spiking_threshold(self, Imax=5e2, rtol=.05):
+    def find_spiking_threshold(self, Pmax=5., rtol=.05):
         '''
-        Find threshold intensity driving a network response (i.e., at least 1 AP in at least 1 node)
+        Find threshold amplitude driving a network response (i.e., at least 1 AP in at least 1 node)
 
-        :param Imax: upper bound of intensity search range (W/cm2)
-        :param rtol: relative tolerance for threshold estimation, i.e. (Iout - Ithr) / Ithr < rtol
-        :return: threshold intensity (W/cm2)
+        :param Pmax: upper bound of pressure amplitude search range (MPa)
+        :param rtol: relative tolerance for threshold estimation, i.e. (Pout - Pthr) / Pthr < rtol
+        :return: threshold pressure amplitude (MPa)
         '''
         # Define search interval
-        Ibounds = [0, Imax]
+        Pbounds = [0, Pmax]
 
-        self.log(f'finding response thresold intensity within {Ibounds} W/cm2 interval')
+        self.log(f'finding response thresold pressure amplitude within {Pbounds} MPa interval')
         # Turn off verbosity temporarily
         vb = self.verbose
         self.verbose = False
 
-        # Check that upper bound intensity generates at least 1 spike 
-        if not self.is_excited(Imax):
-            raise ValueError(f'no response detected up to I = {Imax:.2f} W/cm2')
+        # Check that upper bound pressure amplitude generates at least 1 spike 
+        if not self.is_excited(Pmax):
+            raise ValueError(f'no response detected up to P = {Pmax:.2f} MPa')
 
         # Set up binary search
         conv = False
         while not conv:
-            rel_var = (Ibounds[1] - Ibounds[0]) / Ibounds[1]
-            I = (Ibounds[0] + Ibounds[1]) / 2
+            rel_var = (Pbounds[1] - Pbounds[0]) / Pbounds[1]
+            I = (Pbounds[0] + Pbounds[1]) / 2
             if self.is_excited(I):
                 if rel_var < rtol:
                     conv = True
-                Ibounds[1] = I
+                Pbounds[1] = I
             else:
-                Ibounds[0] = I
+                Pbounds[0] = I
         
         # Reset verbosity
         self.verbose = vb
 
-        # Return threshold intensity
+        # Return threshold amplitude
         return I
     
     def extract_ap_times(self, t, v, vref=0):
@@ -2113,11 +2117,11 @@ class NeuralNetwork:
 
         # If stimulus timeseries data exists
         if hasstim:
-            # Extract max stimulus intensity per column, and complete column titles
-            Isppas = timeseries[self.STIM_KEY].groupby(colkey).max()
+            # Extract max stimulus amplitude per column, and complete column titles
+            Pamps = timeseries[self.STIM_KEY].groupby(colkey).max()
             if colkey == self.NODE_KEY:
-                for ax, Isppa in zip(axes[0], Isppas):
-                    ax.set_title(f'{ax.get_title()}: {Isppa:.0f} W/cm2')
+                for ax, Pamp in zip(axes[0], Pamps):
+                    ax.set_title(f'{ax.get_title()}: {Pamp:.1f} MPa')
             
             # Extract stimulus bounds            
             tvec, _ = self.get_stim_vecs()
@@ -2150,7 +2154,7 @@ class NeuralNetwork:
         # Plot stimulus time-course per column
         if hasstim:
             axrow = axes[irow]
-            axrow[0].set_ylabel(self.ISPPA_KEY)
+            axrow[0].set_ylabel(self.P_MPA_KEY)
             for ax, (_, stim) in zip(axrow, timeseries[self.STIM_KEY].groupby(colkey)):
                 stim.droplevel(dropkey).plot(ax=ax, c='k', lw=lw)
             axrow[-1].legend(**leg_kwargs)
@@ -2354,14 +2358,14 @@ class NeuralNetwork:
         # Plot raster symbols
         ax.plot(times, np.full_like(times, y), symbol, color=color, label=label, ms=marker_size)
     
-    def get_stimdist_vector(self, kind='uniform'):
+    def get_stimdist_vector(self, kind='all'):
         '''
         Return stimulus distribution vector for a given kind of stimulus distribution.
 
-        :param kind: stimulus distribution kind (default: 'uniform'). One of:
+        :param kind: stimulus distribution kind (default: 'all'). One of:
             - "single": single node stimulated
-            - "uniform": all nodes stimulated with equal intensity
-            - integer/float: custom fraction of nodes stimulated with equal intensity
+            - "all": all nodes stimulated with equal amplitude
+            - integer/float: custom fraction of nodes stimulated with equal amplitude
         :return: stimulus distribution vector
         '''        
         # Return stimulus distribution vector
@@ -2369,7 +2373,7 @@ class NeuralNetwork:
             x = np.zeros(self.size)
             x[0] = 1
             return x
-        elif kind == 'uniform':
+        elif kind == 'all':
             return np.ones(self.size)
         elif isinstance(kind, (int, float)):
             frac = kind
@@ -2386,7 +2390,7 @@ class NeuralNetwork:
         '''
         Return dictionary of stimulus distribution vectors for all stimulus distribution kinds.
         '''
-        return {kind: self.get_stimdist_vector(kind) for kind in ['single', 'uniform']}
+        return {kind: self.get_stimdist_vector(kind) for kind in ['single', 'all']}
         
     def check_stimulus_distribution(self, x):
         '''
@@ -2402,14 +2406,14 @@ class NeuralNetwork:
         if sum(x) == 0:
             raise ValueError('At least one stimulus value must be non-zero')
     
-    def run_stim_sweep(self, Isppas, stimdist=None, nreps=1, **kwargs):
+    def run_stim_sweep(self, amps, stimdist=None, nreps=1, **kwargs):
         ''' 
-        Simulate model across a range of stimulus intensities and return outputs.
+        Simulate model across a range of stimulus amplitudes and return outputs.
         
-        :param Isppas: range of stimulus intensities (W/cm2)
-        :param stimdist (optional): vector spcifying relative stimulus intensities at each node. 
-            If not provided, all nodes will be stimulated with the same intensity.
-        :param nreps (optional): number of repetitions per stimulus intensity (default: 1)
+        :param Pamps: range of stimulus amplitudes
+        :param stimdist (optional): vector spcifying relative stimulus amplitudes at each node. 
+            If not provided, all nodes will be stimulated with the same amplitude.
+        :param nreps (optional): number of repetitions per stimulus amplitude (default: 1)
         :param kwargs: optional arguments passed to "set_stim" and "simulate" methods
         :return: multi-indexed output dataframe with sweep variable, node index and time
         '''
@@ -2419,10 +2423,10 @@ class NeuralNetwork:
         
         # Check that stimulus distribution vector is valid
         self.check_stimulus_distribution(stimdist)
-        self.log(f'running simulation sweep across {len(Isppas)} stimulus intensities')
+        self.log(f'running simulation sweep across {len(amps)} stimulus amplitudes')
 
-        # Generate 2D array of stimulus vectors for each stimulus intensity
-        Isppa_vec_range = np.dot(np.atleast_2d(Isppas).T, np.atleast_2d(stimdist))
+        # Generate 2D array of stimulus vectors for each stimulus amplitude
+        amp_vec_range = np.dot(np.atleast_2d(amps).T, np.atleast_2d(stimdist))
 
         # Disable verbosity during sweep
         vb = self.verbose
@@ -2434,19 +2438,19 @@ class NeuralNetwork:
         # Simulate model for each stimulus vector, and append output to data
         tstop = kwargs.pop('tstop', None)
         dt = kwargs.pop('dt', None)
-        for Isppa_vec in tqdm(Isppa_vec_range):
-            self.set_stim(Isppa_vec, **kwargs)
+        for amp_vec in tqdm(amp_vec_range):
+            self.set_stim(amp_vec, **kwargs)
             data.append(self.simulate(tstop=tstop, nreps=nreps, dt=dt))
         
         # Restore verbosity
         self.verbose = vb
 
         # Concatenate data and events with new sweep index level, and return
-        return self.concatenate_outputs(Isppas, data, self.ISPPA_KEY)
+        return self.concatenate_outputs(amps, data, self.P_MPA_KEY)
     
     def plot_sweep_results(self, data, metric=None, title=None, ax=None, width=4, height=2, 
                            legend=True, marker='o', markersize=4, lw=1, 
-                           estimator='median', errorbar='se', Pmap='full', xscale='linear'):
+                           estimator='mean', errorbar='se', Pmap='full', xscale='linear'):
         '''
         Plot results of a sweep.
         
@@ -2516,7 +2520,7 @@ class NeuralNetwork:
         # If 2 extra dimensions, extract sweep key and extra dimension key
         if len(extradims) == 2:
             try:
-                idx = extradims.index(self.ISPPA_KEY)
+                idx = extradims.index(self.P_MPA_KEY)
                 sweepkey, extrakey = extradims[idx], extradims[1 - idx]
             except ValueError:
                 extrakey, sweepkey = extradims
@@ -2604,10 +2608,6 @@ class NeuralNetwork:
         # Set x-axis scale
         self.set_ax_scale(ax, key='x', scale=xscale)
 
-        # Add pressure mapping, if specified
-        if sweepkey == self.ISPPA_KEY and Pmap:
-            self.add_pressure_mapping(ax, label=Pmap == 'full')
-
         # Add title, if specified
         if title is not None:
             ax.set_title(title)
@@ -2615,38 +2615,37 @@ class NeuralNetwork:
         # Return figure
         return fig
 
-    def compute_istim(self, Isppa):
+    def compute_istim(self, Pamp):
         ''' 
-        Compute stimulus-driven current amplitude for a given stimulus intensity
+        Compute stimulus-driven current amplitude for a given stimulus amplitude
 
-        :param Isppa: stimulus intensity (W/cm2)
+        :param Pamp: peak pressure amplitude (MPa)
         :return: stimulus-driven current amplitude (mA/cm2)
         '''
-        # Compute stimulus-driven current amplitude over Isppa range
-        # iStim = -self.iStimbar * exp_cdf(Isppa, self.iStimdx)
-        iStim = -self.a * np.power(Isppa, self.b)
+        # Compute stimulus-driven current amplitude over amplitude range
+        iStim = -self.a * np.power(Pamp)
 
         # If input is an array, format as series
-        if isinstance(Isppa, (tuple, list, np.ndarray)):
-            iStim = pd.Series(iStim, index=Isppa, name='iStim (mA/cm2)')
-            iStim.index.name = self.ISPPA_KEY
+        if isinstance(Pamp, (tuple, list, np.ndarray)):
+            iStim = pd.Series(iStim, index=Pamp, name='iStim (mA/cm2)')
+            iStim.index.name = self.P_MPA_KEY
             iStim -= iStim.max()
 
         # Return
         return iStim
     
-    def compute_Tmax(self, Isppa, dur=None):
+    def compute_Tmax(self, Pamp, dur=None):
         '''
         Compute temperature reached at the end of a stimulus of 
-        specific intensity and duration.
+        specific amplitude and duration.
 
-        :param Isppa: stimulus intensity (W/cm2)
+        :param Pamp: peak pressure amplitude (MPa)
         :param dur (optional): stimulus duration (ms)
         :return: maximal temperature reached (°C)
         '''
         # If input is an list/tuple, convert to numpy array
-        if isinstance(Isppa, (tuple, list)):
-            Isppa = np.asarray(Isppa)
+        if isinstance(Pamp, (tuple, list)):
+            Pamp = np.asarray(Pamp)
 
         # If duration not provided, use class attribute
         if dur is None:
@@ -2654,6 +2653,9 @@ class NeuralNetwork:
                 raise ValueError('No stimulus duration defined')
             dur = self.dur
 
+        # Compute acoustic intensity during stimulus
+        Isppa = pressure_to_intensity(Pamp * 1e6) * 1e-4  # W/cm2 
+        
         # Compute steady-state temperature
         ΔTinf = self.alphaT * Isppa
         Tinf = ΔTinf + self.Tref
@@ -2664,10 +2666,10 @@ class NeuralNetwork:
             c1 = -self.tauT_abs * np.log((ΔTinf))
         Tmax = Tinf - np.exp(-(dur + c1) / self.tauT_abs)
 
-        # If Isppa or duration is an array, format as series
-        if isinstance(Isppa, (tuple, list, np.ndarray)):
-            Tmax = pd.Series(Tmax, index=Isppa, name='Tmax (°C)')
-            Tmax.index.name = self.ISPPA_KEY
+        # If Pamp or duration is an array, format as series
+        if isinstance(Pamp, (tuple, list, np.ndarray)):
+            Tmax = pd.Series(Tmax, index=Pamp, name='Tmax (°C)')
+            Tmax.index.name = self.P_MPA_KEY
         if isinstance(dur, (tuple, list, np.ndarray)):
             Tmax = pd.Series(Tmax, index=dur, name='Tmax (°C)')
             Tmax.index.name = self.DUR_KEY
@@ -2675,16 +2677,16 @@ class NeuralNetwork:
         # Return
         return Tmax
     
-    def compute_iKTmax(self, Isppa, **kwargs):
+    def compute_iKTmax(self, Pamp, **kwargs):
         '''
         Compute maximal thermally-activated potassium current amplitude
-        for a given stimulus intensity
+        for a given stimulus amplitude
 
-        :param Isppa: stimulus intensity (W/cm2)
+        :param Pamp: peak pressure amplitude (MPa)
         :return: thermally-activated potassium current amplitude (mA/cm2)
         '''
         # Compute maximal temperature reached
-        Tmax = self.compute_Tmax(Isppa, **kwargs)
+        Tmax = self.compute_Tmax(Pamp, **kwargs)
         
         # Compute potassium current for that temperature
         gKTmax = self.gKT * (Tmax - self.Tref)
@@ -2697,11 +2699,11 @@ class NeuralNetwork:
         # Return
         return iKTmax
     
-    def compute_EI_currents(self, Isppa, dur=None):
+    def compute_EI_currents(self, Pamp, dur=None):
         '''
-        Compute excitatory and inhibitory currents for a given stimulus intensity
+        Compute excitatory and inhibitory currents for a given stimulus amplitude
 
-        :param Isppa: stimulus intensity (W/cm2)
+        :param Pamp: peak pressure amplitude (MPa)
         :return: dataframe of excitatory and inhibitory currents (mA/cm2)
         '''
         # If duration not provided, use class attribute
@@ -2711,20 +2713,20 @@ class NeuralNetwork:
             dur = self.dur
 
         # Compute stimulus-driven and thermally-activated currents amplitude
-        # over Isppa range
+        # over Pamp range
         return pd.concat([
-            self.compute_istim(Isppa),  # stimulus-driven current
-            self.compute_iKTmax(Isppa, dur=dur),  # thermally-activated current at end of stimulus
-            self.compute_iKTmax(Isppa, dur=dur / 2).rename('iKT1/2 (mA/cm2)'),  # thermally-activated current at half stimulus duration
+            self.compute_istim(Pamp),  # stimulus-driven current
+            self.compute_iKTmax(Pamp, dur=dur),  # thermally-activated current at end of stimulus
+            self.compute_iKTmax(Pamp, dur=dur / 2).rename('iKT1/2 (mA/cm2)'),  # thermally-activated current at half stimulus duration
         ], axis=1)
     
-    def plot_EI_imbalance(self, Isppa, ax=None, add_Pmap=True, legend=True, ls='-', 
+    def plot_EI_imbalance(self, Pamp, ax=None, add_Pmap=True, legend=True, ls='-', 
                           xscale='linear', **kwargs):
         '''
         Plot the imbalance between excitatory and inhibitory currents 
-        over a range of stimulus intensities.
+        over a range of stimulus amplitudes.
 
-        :param Isppa: stimulus intensity vector (W/cm2)
+        :param Pamp: peak pressure amplitude (MPa) or range of amplitudes
         :param ax: optional axis handle (default: None)
         :param add_Pmap: whether to add x-axis with pressure values mapped to input Isspa values (default: False)
         :param legend: whether to add a legend to the graph(s)
@@ -2736,13 +2738,13 @@ class NeuralNetwork:
             - "sqrt"
         :return: figure handle
         '''
-        # If Isppa is a scalar of a size 1 vector, generate dense linear range between 0 and that value
-        if not isinstance(Isppa, (tuple, list, np.ndarray)) or len(Isppa) < 2:
-            Isppa = np.linspace(0, Isppa, 100)
+        # If Pamp is a scalar of a size 1 vector, generate dense linear range between 0 and that value
+        if not isinstance(Pamp, (tuple, list, np.ndarray)) or len(Pamp) < 2:
+            Pamp = np.linspace(0, Pamp, 100)
         
-        # Compute excitatory and inhibitory currents over Isppa range, and 
+        # Compute excitatory and inhibitory currents over pressure amplitude range, and 
         # convert to absolute values
-        df = self.compute_EI_currents(Isppa, **kwargs).abs()
+        df = self.compute_EI_currents(Pamp, **kwargs).abs()
 
         # Remove units from currents names
         df.columns = df.columns.str.rstrip('(mA/cm2)').str.rstrip(' ')
@@ -2874,43 +2876,11 @@ class NeuralNetwork:
         else:
             setscalefunc(scale)
     
-    def add_pressure_mapping(self, ax, label=True):
+    def run_comparative_sweep(self, Pamps, metric, stimdists=None, sigmaI=None, **kwargs):
         '''
-        Add pressure mapping to axis
+        Compute metric over Pamp sweep for both single node and uniform stimulus distributions,
 
-        :param ax: axis handle
-        '''
-        # Create new axis sharing same vertical settings
-        ax2 = ax.twiny()
-
-        # Extract x-axis bounds
-        Ibounds = ax.get_xlim()
-
-        # Determine pressure range, and corresponding intensity values
-        Pmax = intensity_to_pressure(Ibounds[1] * 1e4) * 1e-6  # MPa
-        Prange = np.arange(0, Pmax).astype(int)  # MPa
-        Iticks = pressure_to_intensity(Prange * 1e6) / 1e4  # W/cm2
-
-        # If necessary, sdjust x-scale of new axis
-        if ax.get_xscale() == 'function':
-            self.set_ax_scale(ax2, key='x', scale='sqrt')
-        
-        # Set x-axis bounds and x-ticks
-        ax2.set_xlim(*Ibounds)
-        ax2.set_xticks(Iticks)  # W/cm2
-
-        # If requested, add x-axis label
-        if label:
-            ax2.set_xlabel('P (MPa)')
-            ax2.set_xticklabels(Prange)
-        else:
-            ax2.set_xticklabels([])
-    
-    def run_comparative_sweep(self, Isppas, metric, stimdists=None, sigmaI=None, **kwargs):
-        '''
-        Compute metric over Isppa sweep for both single node and uniform stimulus distributions,
-
-        :param Isppas: stimulus intensity vector (W/cm2)
+        :param Pamps: peak pressure amplitude vector (MPa)
         :param metric: name of metric to compute
         :param stimdists (optional): stimulus distribution vector(s) (default: None). If not provided,
             both single node and uniform distributions will be used.
@@ -2928,8 +2898,8 @@ class NeuralNetwork:
             # If required, add random variations in relative stimulus amplitudes
             if sigmaI is not None:
                 dist = np.array([max(np.random.normal(I, sigmaI * I), 0) for I in dist])
-            # Run sweep over stimulus intensities, 
-            data = self.run_stim_sweep(Isppas, stimdist=dist, **kwargs)
+            # Run sweep over stimulus amplitudes 
+            data = self.run_stim_sweep(Pamps, stimdist=dist, **kwargs)
             # Compute metric, and append to list
             mdata.append(self.compute_metric(data, metric))
             # Append stimulus distribution key to list
@@ -2938,13 +2908,13 @@ class NeuralNetwork:
         # Concatenate metric results and return
         return self.concatenate_outputs(kinds, mdata, 'stim dist.')
 
-    def explore2D(self, wrange, arange, Isppa_range, title=None, metric='nspikes', **kwargs):
+    def explore2D(self, wrange, arange, Pamp_range, title=None, metric='nspikes', **kwargs):
         '''
         Explore 2D parameter space of synaptic weight and stimulus sensitivity.
         
         :param wrange: synaptic weight range (S/cm2)
         :param arange: stimulus sensitivity range (-)
-        :param Isppa_range: range of intensities to sweep (W/cm2)
+        :param Pamp_range: range of peak presure amplitudes to sweep (MPa)
         :param title: figures title
         :return: figure handles
         '''
@@ -2959,7 +2929,7 @@ class NeuralNetwork:
         for a, EIax in zip(arange, EIaxes):
             # Set stimulus sensitivity parameter
             self.set_mech_param(a=a)
-            self.plot_EI_imbalance(Isppa_range.max(), ax=EIax, legend=EIax is EIaxes[-1], xscale=xscale)
+            self.plot_EI_imbalance(Pamp_range.max(), ax=EIax, legend=EIax is EIaxes[-1], xscale=xscale)
             EIax.set_title(f'a = {a:.2e}', fontsize=10)
             xscale = None
 
@@ -2968,10 +2938,10 @@ class NeuralNetwork:
                 # Set synaptic weight parameter
                 self.set_synaptic_weight(w)
 
-                # Run comparative Isppa sweep for each stimulus distribution, compute metric
+                # Run comparative Pamp sweep for each stimulus distribution, compute metric
                 # and append to container
                 mdata.append(
-                    self.run_comparative_sweep(Isppa_range, metric, **kwargs))
+                    self.run_comparative_sweep(Pamp_range, metric, **kwargs))
 
         # Concatenate results
         mdata = self.concatenate_outputs(
@@ -2980,8 +2950,8 @@ class NeuralNetwork:
             ['a', 'w (uS/cm2)']
         )
 
-        # Plot Isppa dependencies
-        self.log('plotting Isppa dependencies...')
+        # Plot pressure dependencies
+        self.log('plotting pressure dependencies...')
         fg = sns.FacetGrid(
             mdata.reset_index(),
             row='w (uS/cm2)',
@@ -3016,14 +2986,14 @@ class NeuralNetwork:
     
     def find_threshold(self, s, value=1, agg='max', side='sub'):
         ''' 
-        Find threshold Isppa value where metric reaches a critical level
+        Find threshold pressure amplitude value where metric reaches a critical level
         
         :param s: metric pandas Series
         :param value: critical metric level
         :param agg: method used to aggregate matric across ndoes prior to threshold computation
         :param side: string indicating whether to return the just sub-threshold value ("sub"),
             just supra-threshold value ("supra"), or a mid-point between the two ("mid")
-        :return: threshold Isppa value
+        :return: threshold peak pressure amplitude value (MPa)
         '''
         # If "mid" side requested, recursively call function for both "sub" and "supra" sides
         if side == 'mid':
@@ -3046,11 +3016,11 @@ class NeuralNetwork:
         else:
             raise ValueError(f'Invalid value for "side" argument: {side}')
         
-        # Group data across all non-intensity dimensions, and extract 
-        # max or min Isppa value for each group
-        Isppas = sagg.reset_index(level=self.ISPPA_KEY)[self.ISPPA_KEY]
-        gby = [k for k in sagg.index.names if k != self.ISPPA_KEY]
-        groups = Isppas.groupby(gby)
+        # Group data across all non-amplitude dimensions, and extract 
+        # max or min Pamp value for each group
+        Pamps = sagg.reset_index(level=self.P_MPA_KEY)[self.P_MPA_KEY]
+        gby = [k for k in sagg.index.names if k != self.P_MPA_KEY]
+        groups = Pamps.groupby(gby)
         threshs = groups.max() if side == 'sub' else groups.min()
 
         # Return
