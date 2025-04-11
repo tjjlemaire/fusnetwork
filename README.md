@@ -1,6 +1,6 @@
 # FUS network
 
-This repository contains a simplistic network model to run simulations of FUS cortical neuromodulation.
+This repository contains a simplistic network model to run simulations of FUS cortical neuromodulation, as reported in the Nature BME paper by Estrada et al. (2025). 
 
 ## Installation
 
@@ -23,7 +23,4 @@ pip install -r requirements.txt
 
 ## Usage
 
-- Execute the `test_network.py` script to run simulations of the cortical network and plot results:
-```
-python test_network.py
-```
+To reproduce the results of Figure 5 of the paper, execute the `hTUS_paper.ipynb` notebook.
